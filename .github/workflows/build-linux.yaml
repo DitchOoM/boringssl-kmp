@@ -1,0 +1,86 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# Build & package the canonical Linux BoringSSL bundles (RFC §7/§8/§8a).
+#
+# Reusable lane. Builds both linux triples inside the manylinux2014 (glibc 2.17) container so the
+# archives are Kotlin/Native-floor-safe (linuxX64 native, linuxArm64 under qemu), runs the
+# glibc-floor gate, packages the tarballs, and uploads them.
+#
+# STABLE CACHING — every expensive Linux step is content-addressed on the PINNED inputs (the BoringSSL
+# commit in the version catalog + the container recipe), never on time/run:
+#   • built archives  (boringssl-build/libs)  keyed on commit+recipe  → a hit skips the ~10-min
+#     from-source build entirely (the build task's marker `onlyIf` short-circuits).
+#   • BoringSSL source clone  (boringssl-build/build/boringssl/src)   keyed on commit.
+#   • Kotlin/Native toolchain (~/.konan)                              keyed on the catalog.
+#   • Docker Buildx layer cache (type=gha)                            for the manylinux image.
+#   • Gradle build cache                                              via setup-gradle.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+name: "Build & Package (Linux)"
+
+on:
+  workflow_call: {}
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "BoringSSL linux (x64 + arm64, manylinux2014)"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: Setup Gradle (build cache)
+        uses: gradle/actions/setup-gradle@v6
+
+      # qemu + buildx so the arm64 triple builds natively in manylinux2014_aarch64, and both images
+      # get Buildx GHA layer caching. (docker/setup-buildx makes `docker buildx` available.)
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Stable caches, all keyed on the PINNED commit (+ recipe for the built archives) ──
+      - name: Cache Kotlin/Native (floor sysroots + prebuilts)
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ runner.os }}-
+
+      - name: Cache BoringSSL source clone
+        uses: actions/cache@v4
+        with:
+          path: boringssl-build/build/boringssl/src
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+
+      # THE big one: restore the built archives; a hit turns the from-source build into a no-op.
+      - name: Cache built BoringSSL archives
+        id: libs-cache
+        uses: actions/cache@v4
+        with:
+          path: boringssl-build/libs/boringssl
+          key: bssl-libs-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-boringssl.sh') }}
+
+      - name: Build + floor-gate + package (both linux triples)
+        run: ./gradlew :boringssl-build:packageBoringSslLinux --stacktrace
+
+      - name: Upload BoringSSL linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-linux-bundles
+          path: |
+            boringssl-build/build/dist/*.tar.gz
+            boringssl-build/build/dist/*.sha256
+            boringssl-build/build/dist/*.provenance.json
+            boringssl-build/build/dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

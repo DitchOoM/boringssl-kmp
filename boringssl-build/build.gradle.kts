@@ -32,9 +32,14 @@ val bundleVersion = (findProperty("boringsslBundleVersion") as String?) ?: "0.0.
 // avoided so re-packaging is bit-stable).
 val sourceDateEpoch = "1683582543"
 
-// One K/N triple's build recipe. `crossCc == null` means "build natively with the host compiler".
+// One K/N triple's build recipe. The CANONICAL build runs inside the manylinux2014 (glibc 2.17)
+// container, native-per-arch (amd64 directly / arm64 under qemu) — see docker/. The crossCc/host
+// fields drive only the `-PnoContainer` dev fallback (host build; will fail the glibc-floor gate on a
+// modern host — that's expected, it's dev-only).
 data class NativeTriple(
     val id: String, // konan target id, e.g. linuxX64 — also the tarball/dir suffix
+    val dockerArch: String, // amd64 | arm64 (manylinux base + Go tarball suffix)
+    val dockerPlatform: String, // linux/amd64 | linux/arm64
     val crossCc: String?,
     val crossCxx: String?,
     val crossSystemProcessor: String?,
@@ -43,17 +48,80 @@ data class NativeTriple(
 
 val linuxTriples =
     listOf(
-        NativeTriple("linuxX64", crossCc = null, crossCxx = null, crossSystemProcessor = null, extraCFlags = listOf("-fPIC")),
-        // arm64: cross only when the host isn't already aarch64. -mno-outline-atomics avoids emitting
+        NativeTriple(
+            "linuxX64", dockerArch = "amd64", dockerPlatform = "linux/amd64",
+            crossCc = null, crossCxx = null, crossSystemProcessor = null, extraCFlags = listOf("-fPIC"),
+        ),
+        // arm64: native aarch64 in the container (qemu). -mno-outline-atomics avoids emitting
         // __aarch64_cas*/__aarch64_ldadd* helper refs the K/N linker can't resolve (socket's fix).
         NativeTriple(
-            "linuxArm64",
+            "linuxArm64", dockerArch = "arm64", dockerPlatform = "linux/arm64",
             crossCc = "aarch64-linux-gnu-gcc",
             crossCxx = "aarch64-linux-gnu-g++",
             crossSystemProcessor = "aarch64",
             extraCFlags = listOf("-fPIC", "-mno-outline-atomics"),
         ),
     )
+
+// ── Canonical build container (RFC §8a) ─────────────────────────────────────────────────────────
+// The manylinux2014 image is content-addressed by a hash of the Dockerfile + build script, so it is
+// a stable cache entry: built once, reused until the recipe changes.
+val dockerDir = projectDir.resolve("docker")
+val dockerRecipeHash =
+    run {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        listOf(dockerDir.resolve("Dockerfile"), dockerDir.resolve("build-boringssl.sh")).forEach {
+            if (it.exists()) md.update(it.readBytes())
+        }
+        md.digest().joinToString("") { "%02x".format(it) }.take(12)
+    }
+fun imageTag(arch: String) = "ditchoom-boringssl-build:ml2014-$arch-$dockerRecipeHash"
+
+val dockerUsable =
+    !project.hasProperty("noContainer") &&
+        try {
+            ProcessBuilder("docker", "info").redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD).start().waitFor() == 0
+        } catch (e: Exception) { false }
+
+fun execCapture(vararg cmd: String): String =
+    ProcessBuilder(*cmd).start().let { p -> val o = p.inputStream.bufferedReader().readText(); p.waitFor(); o.trim() }
+
+// Build the manylinux2014 image once, per arch, tagged by the recipe hash → a stable cache entry.
+fun ensureImage(arch: String, platform: String, tag: String) {
+    val present =
+        try {
+            ProcessBuilder("docker", "image", "inspect", tag)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start().waitFor() == 0
+        } catch (e: Exception) { false }
+    if (present) return
+    val base = if (arch == "arm64") "quay.io/pypa/manylinux2014_aarch64" else "quay.io/pypa/manylinux2014_x86_64"
+    val hostArch = if (System.getProperty("os.arch") in listOf("aarch64", "arm64")) "arm64" else "amd64"
+    logger.lifecycle("Building canonical build image $tag (once; cached thereafter)...")
+    // Native arch → legacy builder (no buildx dependency). Cross arch → buildx + qemu (CI installs
+    // them via docker/setup-buildx-action + docker/setup-qemu-action). BASE selects the arch's glibc-2.17
+    // image; the Dockerfile's Go tarball follows TARGETARCH (set by buildkit for the cross case).
+    val cmd: List<String>
+    val buildkit: String
+    if (arch == hostArch) {
+        cmd = listOf("docker", "build", "--build-arg", "BASE=$base", "-t", tag, dockerDir.absolutePath)
+        buildkit = "0"
+    } else {
+        cmd = listOf("docker", "buildx", "build", "--platform", platform, "--build-arg", "BASE=$base", "-t", tag, "--load", dockerDir.absolutePath)
+        buildkit = "1"
+    }
+    val pb = ProcessBuilder(cmd).directory(projectDir).redirectErrorStream(true)
+    pb.environment()["DOCKER_BUILDKIT"] = buildkit
+    val code = pb.start().also { it.inputStream.bufferedReader().forEachLine { l -> logger.lifecycle(l) } }.waitFor()
+    if (code != 0) {
+        throw GradleException(
+            "docker build failed for $tag (arch=$arch, host=$hostArch)." +
+                if (arch != hostArch) " Cross-arch builds need buildx + qemu — CI provides them; locally run " +
+                    "`docker run --privileged --rm tonistiigi/binfmt --install all` and install docker-buildx." else "",
+        )
+    }
+}
 
 val boringsslWork = layout.buildDirectory.dir("boringssl")
 val distDir = layout.buildDirectory.dir("dist")
@@ -182,7 +250,9 @@ fun buildHostLibc(triple: String): File? {
 fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>> {
     val cap = t.id.replaceFirstChar { it.uppercase() }
     val outDir = projectDir.resolve("libs/boringssl/${t.id}")
-    val marker = outDir.resolve("lib/.built-$boringsslCommit")
+    // Marker keyed on the BoringSSL commit AND the build-recipe hash, so a container/toolchain change
+    // rebuilds. This is the local build cache: onlyIf skips when a matching archive already exists.
+    val marker = outDir.resolve("lib/.built-$boringsslCommit-$dockerRecipeHash")
     val crossing = t.crossCc != null && System.getProperty("os.arch") != "aarch64"
 
     val build =
@@ -191,65 +261,73 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
             description = "Build BoringSSL static libs (libssl.a + libcrypto.a) + headers for ${t.id}."
             dependsOn(fetchBoringSsl)
             inputs.property("commit", boringsslCommit)
+            inputs.property("recipe", dockerRecipeHash)
+            inputs.property("container", dockerUsable)
             outputs.dir(outDir)
+            outputs.cacheIf { true }
             onlyIf { !marker.exists() }
             doLast {
                 val srcDir = boringsslWork.get().dir("src").asFile
-                val cmakeBuildDir = boringsslWork.get().dir("build-${t.id}").asFile
-                cmakeBuildDir.deleteRecursively(); cmakeBuildDir.mkdirs()
-
                 val cFlags = t.extraCFlags.joinToString(" ")
-                val cmakeArgs =
-                    mutableListOf(
-                        "cmake",
-                        "-DCMAKE_BUILD_TYPE=Release",
-                        "-DBUILD_SHARED_LIBS=OFF",
-                        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
-                        "-DCMAKE_C_FLAGS=$cFlags",
-                        "-DCMAKE_CXX_FLAGS=$cFlags",
-                        "-G", "Unix Makefiles",
+
+                if (dockerUsable) {
+                    // ── CANONICAL: build inside manylinux2014 (glibc 2.17), native per-arch (RFC §8a) ──
+                    val tag = imageTag(t.dockerArch)
+                    ensureImage(t.dockerArch, t.dockerPlatform, tag)
+                    val uid = execCapture("id", "-u")
+                    val gid = execCapture("id", "-g")
+                    logger.lifecycle("Building BoringSSL for ${t.id} in $tag (glibc 2.17)...")
+                    runOrThrow(
+                        "docker", "run", "--rm", "--platform", t.dockerPlatform,
+                        "--user", "$uid:$gid", "-e", "HOME=/tmp", "-e", "CFLAGS=$cFlags", "-e", "CC=cc",
+                        "-v", "${rootDir.absolutePath}:/work",
+                        tag, "/work/boringssl-build/docker/build-boringssl.sh", t.id,
+                        dir = projectDir, what = "container build ${t.id}",
                     )
-                if (crossing) {
-                    cmakeArgs.addAll(
-                        listOf(
-                            "-DCMAKE_SYSTEM_NAME=Linux",
-                            "-DCMAKE_SYSTEM_PROCESSOR=${t.crossSystemProcessor}",
-                            "-DCMAKE_C_COMPILER=${t.crossCc}",
-                            "-DCMAKE_CXX_COMPILER=${t.crossCxx}",
-                        ),
-                    )
+                } else {
+                    // ── DEV FALLBACK (-PnoContainer or no docker): host build. NOT glibc-floor-safe on a
+                    //    modern host — checkGlibcFloor will (correctly) fail it. Dev iteration only. ──
+                    logger.warn("checkGlibcFloor note: ${t.id} built on the HOST (no container) — not release-portable.")
+                    val cmakeBuildDir = boringsslWork.get().dir("build-${t.id}").asFile
+                    cmakeBuildDir.deleteRecursively(); cmakeBuildDir.mkdirs()
+                    val cmakeArgs =
+                        mutableListOf(
+                            "cmake", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+                            "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                            "-DCMAKE_C_FLAGS=$cFlags", "-DCMAKE_CXX_FLAGS=$cFlags", "-G", "Unix Makefiles",
+                        )
+                    if (crossing) {
+                        cmakeArgs.addAll(
+                            listOf(
+                                "-DCMAKE_SYSTEM_NAME=Linux", "-DCMAKE_SYSTEM_PROCESSOR=${t.crossSystemProcessor}",
+                                "-DCMAKE_C_COMPILER=${t.crossCc}", "-DCMAKE_CXX_COMPILER=${t.crossCxx}",
+                            ),
+                        )
+                    }
+                    cmakeArgs.add(srcDir.absolutePath)
+                    runOrThrow(*cmakeArgs.toTypedArray(), dir = cmakeBuildDir, what = "cmake configure ${t.id}")
+                    runOrThrow("make", "-j${Runtime.getRuntime().availableProcessors()}", "ssl", "crypto",
+                        dir = cmakeBuildDir, what = "make ${t.id}")
+                    outDir.resolve("lib").mkdirs()
+                    val ssl = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libssl.a" }
+                        ?: throw GradleException("libssl.a not found for ${t.id}")
+                    val crypto = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libcrypto.a" }
+                        ?: throw GradleException("libcrypto.a not found for ${t.id}")
+                    ssl.copyTo(outDir.resolve("lib/libssl.a"), overwrite = true)
+                    crypto.copyTo(outDir.resolve("lib/libcrypto.a"), overwrite = true)
+                    val compatC = cmakeBuildDir.resolve("isoc23_compat.c").apply { writeText(isoC23CompatSource) }
+                    val compatO = cmakeBuildDir.resolve("isoc23_compat.o")
+                    val cc = t.crossCc ?: "cc"
+                    runOrThrow(cc, "-c", "-fPIC", "-O2", compatC.absolutePath, "-o", compatO.absolutePath,
+                        dir = cmakeBuildDir, what = "compile isoc23 compat ${t.id}")
+                    runOrThrow("ar", "r", outDir.resolve("lib/libcrypto.a").absolutePath, compatO.absolutePath,
+                        dir = cmakeBuildDir, what = "ar-merge isoc23 compat ${t.id}")
+                    val inc = listOf(srcDir.resolve("src/include"), srcDir.resolve("include")).first { it.exists() }
+                    inc.copyRecursively(outDir.resolve("include"), overwrite = true)
                 }
-                cmakeArgs.add(srcDir.absolutePath)
 
-                logger.lifecycle("Configuring BoringSSL for ${t.id}${if (crossing) " (cross)" else ""}...")
-                runOrThrow(*cmakeArgs.toTypedArray(), dir = cmakeBuildDir, what = "cmake configure ${t.id}")
-
-                logger.lifecycle("Building BoringSSL ssl+crypto for ${t.id} (a few minutes)...")
-                val jobs = Runtime.getRuntime().availableProcessors()
-                runOrThrow("make", "-j$jobs", "ssl", "crypto", dir = cmakeBuildDir, what = "make ${t.id}")
-
-                outDir.resolve("lib").mkdirs()
-                val ssl = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libssl.a" }
-                    ?: throw GradleException("libssl.a not found for ${t.id}")
-                val crypto = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libcrypto.a" }
-                    ?: throw GradleException("libcrypto.a not found for ${t.id}")
-                ssl.copyTo(outDir.resolve("lib/libssl.a"), overwrite = true)
-                crypto.copyTo(outDir.resolve("lib/libcrypto.a"), overwrite = true)
-
-                // ar-merge the __isoc23_* compat object into libcrypto.a (glibc>=2.38 K/N link fix).
-                val compatC = cmakeBuildDir.resolve("isoc23_compat.c").apply { writeText(isoC23CompatSource) }
-                val compatO = cmakeBuildDir.resolve("isoc23_compat.o")
-                val cc = t.crossCc ?: "cc"
-                runOrThrow(cc, "-c", "-fPIC", "-O2", compatC.absolutePath, "-o", compatO.absolutePath,
-                    dir = cmakeBuildDir, what = "compile isoc23 compat ${t.id}")
-                runOrThrow("ar", "r", outDir.resolve("lib/libcrypto.a").absolutePath, compatO.absolutePath,
-                    dir = cmakeBuildDir, what = "ar-merge isoc23 compat ${t.id}")
-
-                // Headers (BoringSSL: src/include/openssl/*.h; older layouts: include/).
-                val inc = listOf(srcDir.resolve("src/include"), srcDir.resolve("include")).first { it.exists() }
-                inc.copyRecursively(outDir.resolve("include"), overwrite = true)
-
-                marker.writeText("google/boringssl @ $boringsslCommit (API v$boringsslApiVersion) for ${t.id}\n")
+                require(outDir.resolve("lib/libcrypto.a").exists()) { "libcrypto.a missing after build for ${t.id}" }
+                marker.writeText("google/boringssl @ $boringsslCommit (API v$boringsslApiVersion) ${t.id} [${if (dockerUsable) "container:manylinux2014" else "host"}]\n")
                 logger.lifecycle("BoringSSL built for ${t.id} → ${outDir.resolve("lib")}")
             }
         }
