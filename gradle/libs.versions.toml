@@ -1,0 +1,35 @@
+
+[versions]
+kotlin = "2.4.0"
+androidGradlePlugin = "9.2.1"
+ktlint = "14.2.0"
+# detekt 2.0.0-alpha.5 is built against Kotlin 2.4.0 (matches `kotlin` above).
+# Plugin id moved to `dev.detekt` in 2.0. Run non-blocking with a committed baseline —
+# detekt is the only static analyzer that sees the Native actuals (CodeQL only traces JVM
+# bytecode), so it is the multiplatform-coverage tool here.
+detekt = "2.0.0-alpha.5"
+mavenPublish = "0.37.0"
+dokka = "2.2.0"
+kover = "0.9.8"
+binaryCompatibilityValidator = "0.18.1"
+
+# ── Canonical BoringSSL pin (RFC §10 / §12 D1) ────────────────────────────────────────────────────
+# The ONE 40-hex commit literal permitted anywhere in this tree (the single-pin directive, RFC §8).
+# google/boringssl @ BORINGSSL_API_VERSION 21 (2023-05-08) — the exact tree boring/boring-sys 4.22.0
+# vendors, which is quiche 0.29.2's TLS backend. The canonical pin FOLLOWS the quiche release.
+boringssl = "44b3df6f03d85c901767250329c571db405122d5"
+boringsslApiVersion = "21"
+boringsslQuicheAbi = "quiche 0.29.2 / boring-sys 4.22.0"
+
+[libraries]
+# Consumer modules add their own dependencies; nothing shared is needed for the phase-1 skeleton.
+
+[plugins]
+kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
+android-kmp-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "androidGradlePlugin" }
+ktlint = { id = "org.jlleitschuh.gradle.ktlint", version.ref = "ktlint" }
+detekt = { id = "dev.detekt", version.ref = "detekt" }
+maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }
+dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
+kover = { id = "org.jetbrains.kotlinx.kover", version.ref = "kover" }
+binary-compatibility-validator = { id = "org.jetbrains.kotlinx.binary-compatibility-validator", version.ref = "binaryCompatibilityValidator" }

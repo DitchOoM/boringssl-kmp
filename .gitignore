@@ -1,0 +1,26 @@
+build
+bin
+.idea
+*.iml
+.gradle
+*.swp
+.project
+.kotlin/
+
+!.idea/vcs.xml
+!.idea/runConfigurations
+!.idea/codeStyles
+
+local.properties
+.claude/
+.vscode
+.mcp.json
+
+# ── Binary-repo hygiene (RFC §8: NO committed binaries) ──
+# Built BoringSSL bundles + any raw native artifact. Produced fresh in CI, shipped via GitHub Releases.
+/**/libs/
+*.a
+*.so
+*.dylib
+/**/build/
+.gradle/

@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# Release pipeline (RFC §8) — PLACEHOLDER / STUB. Migration step 1 only wires the shape.
+#
+# Intended shape (RFC §8, label-driven — kept from the webrtc skeleton):
+#   on push to main → version bump from PR labels (`major` / `minor`, else patch;
+#       `skip-release` / `draft-release` alter the flow)
+#     → build-linux + build-apple + build-android
+#     → validate-artifacts (binary-shaped — see review.yaml)
+#     → publish:
+#         - small artifacts (boringssl-provision, -jvm, -android, -bom) → Maven Central (+ Plugin Portal
+#           for the provision plugin)
+#         - heavy static tarballs (boringssl-<ver>-<triple>.tar.gz + .sha256 + SHA256SUMS + provenance)
+#           → GitHub Releases   (never LFS / Packages / Central for the blobs — RFC §3 channel split)
+#     → finalize: tag + GitHub Release; release notes STATE the canonical commit + quiche ABI anchor.
+#   Release short-circuit: skip the compile if a Release for the canonical commit already exists.
+#   Retargeted watchers: native-deps-freshness + weekly-dependency-update track the quiche ABI anchor.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+name: "Merged (Release)"
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '*.md'
+
+concurrency:
+  group: merged-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: "Label-driven release (STUB)"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: "STUB — label-driven version bump + build + validate + publish"
+        run: |
+          echo "TODO step 3 (RFC §10): wire the release flow."
+          echo "  - version bump from PR labels (major/minor/patch; skip-release/draft-release)"
+          echo "  - build + validate-artifacts (binary-shaped)"
+          echo "  - publish small artifacts → Central (+ Plugin Portal); tarballs → GitHub Releases"
+          echo "  - tag + Release; notes state canonical commit + quiche ABI anchor"
+          echo "  - short-circuit if a Release for the canonical commit already exists"
