@@ -33,46 +33,58 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      # STUB: step 2/3 implements the real greps. Enumerated here so the gate exists from day one.
-      - name: "STUB — binary-repo directive greps (RFC §8)"
+      # Binary-repo standing directives (RFC §8), CI-enforced.
+      - name: "No committed native binaries"
         run: |
-          echo "TODO step 2/3: enforce the RFC §8 binary-repo directives:"
-          echo "  - no committed binaries (*.a/*.so/*.dylib/tarballs)"
-          echo "  - exactly ONE boringssl 40-hex commit literal in the tree"
-          echo "  - no BORINGSSL_PREFIX unless catalog-flagged"
+          if git ls-files | grep -E '\.(a|so|dylib|dll)$|\.tar\.gz$' ; then
+            echo "::error::committed native binaries found — they must be gitignored and built in CI"
+            exit 1
+          fi
+      - name: "Exactly ONE BoringSSL commit literal (single-pin)"
+        run: |
+          n=$(git grep -hoE '[0-9a-f]{40}' -- gradle/libs.versions.toml | sort -u | wc -l)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::expected exactly one 40-hex boringssl commit in the catalog, found $n"
+            exit 1
+          fi
+      - name: "No BORINGSSL_PREFIX unless catalog-flagged (one-unprefixed-copy invariant)"
+        run: |
+          if git grep -nE 'BORINGSSL_PREFIX' -- ':!*.md' ':!.github/**' && ! grep -q 'boringsslPrefix' gradle/libs.versions.toml ; then
+            echo "::error::BORINGSSL_PREFIX used without the catalog flag"
+            exit 1
+          fi
 
+  # Real reusable lane — native-runner matrix, manylinux2014 container, glibc-floor gate, caching.
   build-linux:
-    name: "build-linux (STUB)"
     needs: [grep-gate]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - name: "STUB — per-triple cmake (linuxX64, linuxArm64)"
-        run: echo "TODO step 2: :boringssl-build cross-compile + package the Linux triples."
+    uses: ./.github/workflows/build-linux.yaml
 
   build-apple:
-    name: "build-apple (STUB)"
+    name: "build-apple (STUB — step 7)"
     needs: [grep-gate]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v6
-      - name: "STUB — per-SDK cmake (macos/ios/tvos/watchos)"
-        run: echo "TODO step 7: Apple triples (tvOS/watchOS behind the spike)."
+      - name: "Apple triples placeholder"
+        run: |
+          echo "TODO step 7 — macos/ios triples; tvOS/watchOS behind the spike (RFC D4)."
 
   build-android:
-    name: "build-android (STUB)"
+    name: "build-android (STUB — step 7)"
     needs: [grep-gate]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: "STUB — NDK cmake (arm64-v8a, x86_64 only; RFC §5 Rule D)"
-        run: echo "TODO step 7: Android prefab AAR triples."
+      - name: "Android prefab placeholder"
+        run: |
+          echo "TODO step 7 — NDK prefab AAR (arm64-v8a, x86_64 only; RFC §5 Rule D)."
 
   validate-artifacts:
-    name: "validate-artifacts (STUB)"
+    name: "validate-artifacts (STUB — step 3)"
     needs: [build-linux, build-apple, build-android]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: "STUB — binary-shaped validation (RFC §8)"
-        run: echo "TODO step 3: nm single-copy guard, wrapper-.def link, FFM SymbolLookup, quiche link-smoke, per-ABI size."
+      - name: "Binary-shaped validation placeholder"
+        run: |
+          echo "TODO step 3 — nm single-copy guard, wrapper-.def link, FFM SymbolLookup, quiche link-smoke, per-ABI size."

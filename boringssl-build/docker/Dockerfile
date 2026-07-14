@@ -5,8 +5,9 @@
 # manylinux2014 = CentOS 7 / **glibc 2.17** — below BOTH Kotlin/Native sysroot floors
 # (2.19 linuxX64 / 2.25 linuxArm64), so BoringSSL compiled here references only floor-safe libc
 # symbols: no `stat`@GLIBC_2.33, no `__isoc23_*`@GLIBC_2.38. The floor is then enforced by
-# :boringssl-build:checkGlibcFloor<Triple>. Both linux arches use this SAME image (native compile
-# per-arch: amd64 directly, arm64 under qemu), so neither needs a cross-glibc toolchain.
+# :boringssl-build:checkGlibcFloor<Triple>. Both linux arches use this SAME image, compiled NATIVELY
+# per-arch (in CI: linuxX64 on ubuntu-24.04, linuxArm64 on ubuntu-24.04-arm — the legacy builder, no
+# qemu/buildx; locally arm64-on-x64 falls back to buildx+qemu), so neither needs a cross-glibc toolchain.
 #
 # The image is content-addressed (tag carries a hash of this Dockerfile + build-boringssl.sh) and
 # built once, so it is a stable cache entry across builds.

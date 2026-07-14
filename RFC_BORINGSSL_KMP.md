@@ -167,6 +167,12 @@ Keep the webrtc workflow skeleton (`review` → grep-gate → `build-linux` + `b
 `validate-artifacts`; `merged` label-driven release; `native-deps-freshness` +
 `weekly-dependency-update` retargeted to watch the quiche ABI anchor). Add a `build-android` lane.
 
+`build-linux` is a **native-runner matrix**: `linuxX64` on `ubuntu-24.04`, `linuxArm64` on
+`ubuntu-24.04-arm` (GitHub's free public ARM64 runners). Each triple builds its native-arch
+manylinux2014 image with the **legacy builder** — so the canonical CI path needs **no qemu and no
+buildx** (native arm64 is also far faster than emulation). qemu+buildx is only the local-dev fallback
+for cross-building arm64 on an x64 box.
+
 `validate-artifacts` becomes **binary-shaped** (the socket #188 lesson for binaries): per triple, from
 first release — tarball extracts; required headers present; `nm`/`llvm-nm` shows required symbols
 **unprefixed** and **exactly one `libcrypto`**; a throwaway wrapper-`.def` compile+link per K/N triple;

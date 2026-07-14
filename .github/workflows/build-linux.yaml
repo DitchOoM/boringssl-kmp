@@ -1,18 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 # Build & package the canonical Linux BoringSSL bundles (RFC §7/§8/§8a).
 #
-# Reusable lane. Builds both linux triples inside the manylinux2014 (glibc 2.17) container so the
-# archives are Kotlin/Native-floor-safe (linuxX64 native, linuxArm64 under qemu), runs the
-# glibc-floor gate, packages the tarballs, and uploads them.
+# Reusable lane. Each triple builds on its OWN native-arch runner (GitHub's free public ARM64 runners),
+# inside the manylinux2014 (glibc 2.17) container — so every archive is Kotlin/Native-floor-safe
+# (`__xstat` not `stat`@2.33, no `__isoc23`@2.38), and NO qemu / buildx is needed: each runner builds
+# its native-arch image with the legacy builder (:boringssl-build's ensureImage picks legacy for the
+# native arch automatically). Native arm64 is also far faster than emulation.
 #
-# STABLE CACHING — every expensive Linux step is content-addressed on the PINNED inputs (the BoringSSL
-# commit in the version catalog + the container recipe), never on time/run:
-#   • built archives  (boringssl-build/libs)  keyed on commit+recipe  → a hit skips the ~10-min
-#     from-source build entirely (the build task's marker `onlyIf` short-circuits).
-#   • BoringSSL source clone  (boringssl-build/build/boringssl/src)   keyed on commit.
-#   • Kotlin/Native toolchain (~/.konan)                              keyed on the catalog.
-#   • Docker Buildx layer cache (type=gha)                            for the manylinux image.
-#   • Gradle build cache                                              via setup-gradle.
+# STABLE CACHING — every expensive step is content-addressed on the PINNED inputs (BoringSSL commit +
+# container recipe), never on time/run:
+#   • built archives (boringssl-build/libs) keyed on triple+commit+recipe → a hit skips the ~10-min
+#     from-source build (the build task's marker `onlyIf` short-circuits).
+#   • BoringSSL source clone keyed on commit.   • ~/.konan keyed on the catalog.   • Gradle build cache.
+# The manylinux image is layer-cached in the local docker store per runner (recipe-hashed tag).
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 name: "Build & Package (Linux)"
 
@@ -26,9 +26,21 @@ concurrency:
 
 jobs:
   build:
-    name: "BoringSSL linux (x64 + arm64, manylinux2014)"
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    name: "BoringSSL ${{ matrix.triple }} (manylinux2014, native)"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: linuxX64
+            arch: amd64
+            runner: ubuntu-24.04
+            task: packageBoringSslLinuxX64
+          - triple: linuxArm64
+            arch: arm64
+            runner: ubuntu-24.04-arm # native ARM64 — no qemu, legacy-builder native image
+            task: packageBoringSslLinuxArm64
     steps:
       - uses: actions/checkout@v6
 
@@ -41,20 +53,13 @@ jobs:
       - name: Setup Gradle (build cache)
         uses: gradle/actions/setup-gradle@v6
 
-      # qemu + buildx so the arm64 triple builds natively in manylinux2014_aarch64, and both images
-      # get Buildx GHA layer caching. (docker/setup-buildx makes `docker buildx` available.)
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # ── Stable caches, all keyed on the PINNED commit (+ recipe for the built archives) ──
-      - name: Cache Kotlin/Native (floor sysroots + prebuilts)
+      # ── Stable caches, keyed on the PINNED commit (+ recipe for the built archives) ──
+      - name: Cache Kotlin/Native (floor sysroot + prebuilts)
         uses: actions/cache@v4
         with:
           path: ~/.konan
-          key: konan-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml') }}
-          restore-keys: konan-${{ runner.os }}-
+          key: konan-${{ matrix.arch }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ matrix.arch }}-
 
       - name: Cache BoringSSL source clone
         uses: actions/cache@v4
@@ -62,25 +67,45 @@ jobs:
           path: boringssl-build/build/boringssl/src
           key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
 
-      # THE big one: restore the built archives; a hit turns the from-source build into a no-op.
-      - name: Cache built BoringSSL archives
-        id: libs-cache
+      # THE big one: restore this triple's built archives; a hit turns the from-source build into a no-op.
+      - name: Cache built BoringSSL archives (${{ matrix.triple }})
         uses: actions/cache@v4
         with:
-          path: boringssl-build/libs/boringssl
-          key: bssl-libs-${{ runner.os }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-boringssl.sh') }}
+          path: boringssl-build/libs/boringssl/${{ matrix.triple }}
+          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-boringssl.sh') }}
 
-      - name: Build + floor-gate + package (both linux triples)
-        run: ./gradlew :boringssl-build:packageBoringSslLinux --stacktrace
+      - name: Build + floor-gate + package (${{ matrix.triple }})
+        run: ./gradlew :boringssl-build:${{ matrix.task }} --stacktrace
 
-      - name: Upload BoringSSL linux bundles
+      - name: Upload ${{ matrix.triple }} bundle
         uses: actions/upload-artifact@v4
         with:
-          name: boringssl-linux-bundles
+          name: boringssl-${{ matrix.triple }}
           path: |
-            boringssl-build/build/dist/*.tar.gz
-            boringssl-build/build/dist/*.sha256
-            boringssl-build/build/dist/*.provenance.json
-            boringssl-build/build/dist/SHA256SUMS
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz.sha256
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.provenance.json
           if-no-files-found: error
           retention-days: 7
+
+  # Combine per-triple checksums into one SHA256SUMS (the per-triple jobs each see only their own).
+  checksums:
+    name: "Aggregate SHA256SUMS"
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: boringssl-linux*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        run: |
+          cd dist
+          sha256sum boringssl-*.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-linux-SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
