@@ -1,50 +1,118 @@
 package com.ditchoom.boringssl.provision
 
+import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import java.io.File
+import java.net.URI
+import java.security.MessageDigest
 
 /**
- * STUB (migration step 1). The published consumer surface for canonical BoringSSL bundles.
+ * The published consumer surface for canonical BoringSSL bundles (RFC §3/§7).
  *
- * Applying `id("com.ditchoom.boringssl.provision")` registers the [BoringSslProvisionExtension] as
- * `boringssl { }`. Consumers then point cinterop `-libraryPath` / `-staticLibrary` + `includeDirs` at
- * `boringssl.boringsslDir(triple)` (RFC §7).
+ * Applying `id("com.ditchoom.boringssl.provision")` registers [BoringSslProvisionExtension] as
+ * `boringssl { }`. A consumer's cinterop then points `-libraryPath` / `-staticLibrary` + `includeDirs`
+ * at `boringssl.boringsslDir(triple)` — a ~10-line swap for the old ~150-line inline clone+cmake task.
  *
- * Step 2/3 (RFC §10) fills in the real download + verify + extract logic:
- *   - fetch `boringssl-<ver>-<triple>.tar.gz` by **stable direct asset URL**
- *     (`.../releases/download/<tag>/<asset>`), never the `/releases/latest` API (avoids the
- *     60-req/hr unauthenticated limit — RFC §3);
- *   - verify against the **baked-in sha256** (no TOFU) plus `SHA256SUMS`;
- *   - extract into `~/.gradle/caches/ditchoom-boringssl/<ver>/<triple>/{include,lib}`;
- *   - honour a mirror / base-URL override.
+ * Resolution order for a triple (first hit wins):
+ *   1. `localDist` (a `:boringssl-build` `build/dist` dir) — used during migration BEFORE any release
+ *      exists; verified against the sibling `<tarball>.sha256`.
+ *   2. Remote: `<baseUrl>/<version>/boringssl-<version>-<triple>.tar.gz`, fetched by STABLE DIRECT URL
+ *      (never the `/releases/latest` API — avoids the 60-req/hr unauthenticated limit, RFC §3), then
+ *      verified against the BAKED-IN checksum in [checksums] (no TOFU).
+ * Verified tarballs extract once into `<cacheRoot>/<version>/<triple>/{include,lib}`.
  */
 class BoringSslProvisionPlugin : Plugin<Project> {
     override fun apply(target: Project) {
-        target.extensions.create(
-            "boringssl",
-            BoringSslProvisionExtension::class.java,
-            target,
-        )
+        target.extensions.create("boringssl", BoringSslProvisionExtension::class.java, target)
     }
 }
 
-/**
- * STUB extension. `boringsslDir(triple)` returns the cache directory a consumer's cinterop reads its
- * `{include, lib}` from. Step 2/3 replaces the pure path computation with a download-on-demand that
- * materialises + verifies the tarball before returning.
- */
 open class BoringSslProvisionExtension(private val project: Project) {
-    /** Overridable cache root; defaults to the shared per-user Gradle cache. */
-    var cacheRoot: File =
-        File(project.gradle.gradleUserHomeDir, "caches/ditchoom-boringssl")
-
-    /** Pinned bundle version (the boringssl-kmp release, not the BoringSSL commit). Wired in step 3. */
+    /** The boringssl-kmp *release* version (bundle), NOT the BoringSSL commit. */
     var version: String = "0.0.1"
 
     /**
-     * STUB: returns the cache directory for [triple] without downloading anything yet. Step 2/3 makes
-     * this trigger the verified download when the directory is absent.
+     * Base URL for released tarballs. Default is the GitHub Releases download root; a release tag `v$version`
+     * holds `boringssl-<version>-<triple>.tar.gz`. Override for a mirror or an air-gapped proxy.
      */
-    fun boringsslDir(triple: String): File = File(cacheRoot, "$version/$triple")
+    var baseUrl: String = "https://github.com/DitchOoM/boringssl-kmp/releases/download/v"
+
+    /**
+     * Optional local `:boringssl-build` dist dir. When set and it contains the tarball, it is used
+     * instead of a network fetch (dev + the migration window before the first release). Verified
+     * against the sibling `.sha256`.
+     */
+    var localDist: File? = null
+
+    /** Per-user extraction cache. */
+    var cacheRoot: File = File(project.gradle.gradleUserHomeDir, "caches/ditchoom-boringssl")
+
+    /**
+     * Baked-in `triple -> sha256` map for the released tarballs (no trust-on-first-use). Populated per
+     * release (step 3). For a [localDist] resolve the sibling `.sha256` is authoritative and this may
+     * stay empty; for a remote fetch a missing entry is a hard error.
+     */
+    var checksums: Map<String, String> = emptyMap()
+
+    /**
+     * Returns `<cacheRoot>/<version>/<triple>` containing `{include, lib}`, materialising (download →
+     * verify → extract) on first use. Safe to call from a cinterop configuration block.
+     */
+    fun boringsslDir(triple: String): File {
+        val dest = File(cacheRoot, "$version/$triple")
+        val marker = File(dest, ".provisioned-$version")
+        if (marker.exists() && File(dest, "lib").isDirectory && File(dest, "include").isDirectory) return dest
+
+        val tarName = "boringssl-$version-$triple.tar.gz"
+        val (tarball, expected) = resolveTarball(triple, tarName)
+        val actual = sha256(tarball)
+        if (!expected.equals(actual, ignoreCase = true)) {
+            throw GradleException("BoringSSL bundle checksum mismatch for $triple: expected $expected, got $actual (from ${tarball.absolutePath})")
+        }
+
+        dest.deleteRecursively(); File(dest, "lib").mkdirs(); File(dest, "include").mkdirs()
+        val code = ProcessBuilder("tar", "xzf", tarball.absolutePath, "-C", dest.absolutePath)
+            .redirectErrorStream(true).start()
+            .also { it.inputStream.bufferedReader().forEachLine { l -> project.logger.info(l) } }.waitFor()
+        if (code != 0) throw GradleException("Failed to extract $tarName (tar exit $code)")
+        require(File(dest, "lib/libcrypto.a").exists()) { "Extracted bundle for $triple is missing lib/libcrypto.a" }
+        marker.writeText("$actual\n")
+        project.logger.lifecycle("Provisioned BoringSSL $version/$triple → $dest")
+        return dest
+    }
+
+    /** Resolve the tarball (local dist or download) and its expected checksum. */
+    private fun resolveTarball(triple: String, tarName: String): Pair<File, String> {
+        localDist?.let { dist ->
+            val local = File(dist, tarName)
+            if (local.exists()) {
+                val shaFile = File(dist, "$tarName.sha256")
+                val expected = if (shaFile.exists()) shaFile.readText().trim().substringBefore(" ") else sha256(local)
+                return local to expected
+            }
+        }
+        val expected = checksums[triple]
+            ?: throw GradleException(
+                "No baked-in checksum for $triple (version $version) and no localDist tarball. " +
+                    "Set boringssl { checksums = mapOf(\"$triple\" to \"<sha256>\") } or point localDist at :boringssl-build/build/dist.",
+            )
+        val cached = File(cacheRoot, "downloads/$tarName")
+        if (!cached.exists()) {
+            cached.parentFile.mkdirs()
+            val url = "$baseUrl$version/$tarName"
+            project.logger.lifecycle("Downloading BoringSSL bundle: $url")
+            URI(url).toURL().openStream().use { input -> cached.outputStream().use { input.copyTo(it) } }
+        }
+        return cached to expected
+    }
+
+    private fun sha256(f: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        f.inputStream().use { ins ->
+            val buf = ByteArray(1 shl 16)
+            while (true) { val r = ins.read(buf); if (r < 0) break; md.update(buf, 0, r) }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
+    }
 }
