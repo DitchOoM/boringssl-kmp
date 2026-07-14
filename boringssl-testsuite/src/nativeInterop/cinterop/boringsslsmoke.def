@@ -1,0 +1,18 @@
+package = com.ditchoom.boringssl.smoke
+headers = openssl/sha.h
+# glibc 2.19 (K/N linuxX64 floor) keeps pthread + dl in separate libs.
+linkerOpts = -lpthread -ldl
+
+# libraryPaths + staticLibraries (the absolute path to :boringssl-build's container-built archive) are
+# injected by the generateSmokeDef task — see build.gradle.kts.
+
+---
+
+#include <openssl/sha.h>
+#include <stddef.h>
+
+// static-inline wrapper — the by-design cinterop pattern that forces a concrete, callable symbol
+// (bare header decls / macros don't always materialize bindings). Exercises libcrypto's SHA256.
+static inline void bssl_smoke_sha256(const unsigned char *data, size_t len, unsigned char *out) {
+    SHA256(data, len, out);
+}
