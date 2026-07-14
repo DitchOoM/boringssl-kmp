@@ -1,0 +1,9 @@
+/* Linker version script for libboringsslffi.{so} — only the curated shim symbols leave the library;
+ * every BoringSSL symbol pulled from the static archives is localized (hidden). This is half of the
+ * D3 one-unprefixed-copy invariant (the other half is -Wl,--exclude-libs,ALL at link time). */
+{
+    global:
+        boringssl_ffi_*;
+    local:
+        *;
+};

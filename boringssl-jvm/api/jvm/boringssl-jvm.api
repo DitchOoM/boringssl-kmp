@@ -1,0 +1,6 @@
+public final class com/ditchoom/boringssl/BoringSsl {
+	public static final field INSTANCE Lcom/ditchoom/boringssl/BoringSsl;
+	public final fun sha256 ([B)[B
+	public final fun versionNumber ()J
+}
+

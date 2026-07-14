@@ -265,7 +265,9 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
             inputs.property("container", dockerUsable)
             outputs.dir(outDir)
             outputs.cacheIf { true }
-            onlyIf { !marker.exists() }
+            // Rebuild if the archives are stale OR the FFM shared lib is absent (so adding the .so
+            // step re-triggers a triple whose .a were already cached from an earlier recipe).
+            onlyIf { !marker.exists() || !outDir.resolve("lib/libboringsslffi.so").exists() }
             doLast {
                 val srcDir = boringsslWork.get().dir("src").asFile
                 val cFlags = t.extraCFlags.joinToString(" ")
@@ -324,9 +326,32 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                         dir = cmakeBuildDir, what = "ar-merge isoc23 compat ${t.id}")
                     val inc = listOf(srcDir.resolve("src/include"), srcDir.resolve("include")).first { it.exists() }
                     inc.copyRecursively(outDir.resolve("include"), overwrite = true)
+
+                    // libboringsslffi.so (host fallback; mirrors docker/build-boringssl.sh). Only the
+                    // shim's boringssl_ffi_* symbols are exported; BoringSSL stays hidden (D3). NOT
+                    // glibc-floor-safe on a modern host — dev iteration only, same caveat as the .a.
+                    val shimDir = projectDir.resolve("docker")
+                    val ffiCc = t.crossCc ?: "cc"
+                    val shimO = cmakeBuildDir.resolve("boringssl_shim.o")
+                    runOrThrow(
+                        ffiCc, "-c", "-fPIC", "-O2", "-fvisibility=hidden",
+                        "-I", outDir.resolve("include").absolutePath,
+                        shimDir.resolve("boringssl_shim.c").absolutePath, "-o", shimO.absolutePath,
+                        dir = cmakeBuildDir, what = "compile ffi shim ${t.id}",
+                    )
+                    runOrThrow(
+                        ffiCc, "-shared", "-fPIC", "-o", outDir.resolve("lib/libboringsslffi.so").absolutePath,
+                        shimO.absolutePath,
+                        outDir.resolve("lib/libssl.a").absolutePath, outDir.resolve("lib/libcrypto.a").absolutePath,
+                        "-Wl,--exclude-libs,ALL",
+                        "-Wl,--version-script=${shimDir.resolve("boringssl_ffi_exports.map").absolutePath}",
+                        "-Wl,--gc-sections", "-lpthread",
+                        dir = cmakeBuildDir, what = "link libboringsslffi.so ${t.id}",
+                    )
                 }
 
                 require(outDir.resolve("lib/libcrypto.a").exists()) { "libcrypto.a missing after build for ${t.id}" }
+                require(outDir.resolve("lib/libboringsslffi.so").exists()) { "libboringsslffi.so missing after build for ${t.id}" }
                 marker.writeText("google/boringssl @ $boringsslCommit (API v$boringsslApiVersion) ${t.id} [${if (dockerUsable) "container:manylinux2014" else "host"}]\n")
                 logger.lifecycle("BoringSSL built for ${t.id} → ${outDir.resolve("lib")}")
             }
@@ -378,13 +403,26 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                 // Deterministic tar (sorted, fixed owner/mtime) then `gzip -n` (no embedded timestamp).
                 // Two sequential processes via a temp file — NOT a shell pipe (a tar|gzip pipe deadlocks
                 // once gzip's 64KB stdout buffer fills while we're still feeding its stdin).
+                // The K/N/provision tarball carries only the static .a + headers. The FFM shared lib
+                // (libboringsslffi.so) is excluded here — it ships in the boringssl-jvm MRJAR, not the
+                // K/N bundle — so K/N consumers don't pay ~1MB for a library they never link.
                 runOrThrow(
                     "tar", "--sort=name", "--mtime=@$sourceDateEpoch",
-                    "--owner=0", "--group=0", "--numeric-owner",
+                    "--owner=0", "--group=0", "--numeric-owner", "--exclude=libboringsslffi.so",
                     "-cf", tarFile.absolutePath, "-C", outDir.absolutePath, "include", "lib",
                     dir = dist, what = "tar ${t.id}",
                 )
                 runOrThrow("gzip", "-nf", tarFile.absolutePath, dir = dist, what = "gzip ${t.id}")
+
+                // Emit the FFM shared lib as its own checksummed artifact (directive #4: every artifact
+                // carries a sha256). CI uploads these per-runner; the release job gathers all platforms'
+                // .so into the single cross-platform MRJAR.
+                val soSrc = outDir.resolve("lib/libboringsslffi.so")
+                if (soSrc.exists()) {
+                    val soOut = dist.resolve("libboringsslffi-$bundleVersion-${t.id}.so")
+                    soSrc.copyTo(soOut, overwrite = true)
+                    dist.resolve("${soOut.name}.sha256").writeText("${sha256Of(soOut)}  ${soOut.name}\n")
+                }
 
                 val digest = sha256Of(tarGz)
                 dist.resolve("${tarGz.name}.sha256").writeText("$digest  ${tarGz.name}\n")

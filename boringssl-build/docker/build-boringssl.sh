@@ -58,4 +58,21 @@ ar r "$OUT/lib/libcrypto.a" isoc23.o
 # Headers (BoringSSL: src/include/openssl/*.h; older layouts: include/).
 if [ -d "$SRC/src/include" ]; then cp -a "$SRC/src/include/." "$OUT/include/"; else cp -a "$SRC/include/." "$OUT/include/"; fi
 
+# ── libboringsslffi.so — the JVM/FFM shared library (RFC §4) ─────────────────────────────────────
+# Link the curated shim + the just-built static archives into ONE shared object. Only the shim's
+# boringssl_ffi_* symbols are exported (version script); every BoringSSL symbol is hidden
+# (--exclude-libs,ALL) so a second in-process BoringSSL (e.g. quiche_jni) cannot collide — the D3
+# one-unprefixed-copy invariant. Built in the SAME glibc-2.17 container as the archives, so the .so
+# carries the same K/N-floor-safe libc dependency as the tarball's .a.
+SHIM_DIR="/work/boringssl-build/docker"
+echo "== link libboringsslffi.so ($TRIPLE) =="
+$CC -c -fPIC -O2 -fvisibility=hidden -I"$OUT/include" "$SHIM_DIR/boringssl_shim.c" -o boringssl_shim.o
+$CC -shared -fPIC -o "$OUT/lib/libboringsslffi.so" boringssl_shim.o \
+    "$OUT/lib/libssl.a" "$OUT/lib/libcrypto.a" \
+    -Wl,--exclude-libs,ALL -Wl,--version-script="$SHIM_DIR/boringssl_ffi_exports.map" \
+    -Wl,--gc-sections -lpthread
+strip --strip-unneeded "$OUT/lib/libboringsslffi.so"
+
 echo "built ($TRIPLE) on $(getconf GNU_LIBC_VERSION) → $OUT/lib"
+echo "-- libboringsslffi.so exported symbols (expect only boringssl_ffi_*) --"
+nm -D --defined-only "$OUT/lib/libboringsslffi.so" | awk '$2=="T"{print $3}' | sort
