@@ -81,10 +81,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: boringssl-${{ matrix.triple }}
+          # The K/N tarball (+ checksum + provenance) AND the FFM shared library (+ checksum). The .so
+          # is a separate artifact — it ships in the boringssl-jvm MRJAR, not the K/N bundle — but it
+          # rides in the same upload so validate-artifacts fetches everything for this triple at once.
           path: |
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz.sha256
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.provenance.json
+            boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.so
+            boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.so.sha256
           if-no-files-found: error
           retention-days: 7
 
