@@ -114,6 +114,71 @@ fun runOrThrow(vararg cmd: String, dir: File, what: String) {
     if (code != 0) throw GradleException("$what failed (exit $code): ${cmd.joinToString(" ")}")
 }
 
+// ── glibc-floor gate (RFC §8) ─────────────────────────────────────────────────────────────────────
+// K/N links linux consumer binaries against a bundled OLD glibc sysroot (2.19 x64 / 2.25 arm64). Any
+// symbol our archives need that the FLOOR libc lacks fails the consumer's K/N link (that's what the
+// __isoc23_* shim fixes). This is the automated, non-whack-a-mole guard: an "offender" is precisely a
+// symbol the BUILD-host glibc provides but the FLOOR glibc does not — i.e. a too-new glibc dependency.
+// Comparing against host∩¬floor (not a hand-written denylist) catches __isoc23_* AND any future
+// version-gated symbol, while NOT false-flagging libgcc/compiler builtins (absent from host libc).
+
+fun exportedSymbols(so: File): Set<String> {
+    if (!so.exists()) return emptySet()
+    val out = HashSet<String>()
+    val p = ProcessBuilder("nm", "-D", "--defined-only", so.absolutePath).redirectErrorStream(false).start()
+    p.inputStream.bufferedReader().forEachLine { l ->
+        val name = l.trim().substringAfterLast(' ')
+        if (name.isNotEmpty() && !name.contains(' ')) out.add(name.substringBefore('@'))
+    }
+    p.waitFor()
+    return out
+}
+
+fun archiveExternalUndefined(archives: List<File>): Set<String> {
+    val defined = HashSet<String>()
+    val undef = HashSet<String>()
+    for (a in archives) {
+        val p = ProcessBuilder("nm", a.absolutePath).redirectErrorStream(true).start()
+        p.inputStream.bufferedReader().forEachLine { l ->
+            val cols = l.trim().split(Regex("\\s+"))
+            if (cols.size >= 2) {
+                val type = cols[cols.size - 2]
+                val name = cols[cols.size - 1]
+                when {
+                    type == "U" -> undef.add(name)
+                    type.length == 1 -> defined.add(name) // T/t/W/w/D/B/R/… = defined somewhere in the archive
+                }
+            }
+        }
+        p.waitFor()
+    }
+    return undef - defined // truly external refs (intra-archive resolutions removed)
+}
+
+// FLOOR libc(s): the K/N bundled sysroot for the triple (glibc 2.19 x64 / 2.25 arm64).
+fun konanFloorLibs(triple: String): List<File>? {
+    val deps = File(System.getProperty("user.home"), ".konan/dependencies")
+    if (!deps.isDirectory) return null
+    val arch = if (triple == "linuxArm64") "aarch64-unknown-linux-gnu" else "x86_64-unknown-linux-gnu"
+    val dep = deps.listFiles { f -> f.isDirectory && f.name.startsWith(arch) && f.name.contains("glibc") }
+        ?.maxByOrNull { it.name } ?: return null
+    val sysroot = dep.walkTopDown().firstOrNull { it.isDirectory && it.name == "sysroot" } ?: return null
+    return sysroot.walkTopDown()
+        .filter { it.isFile && Regex("^lib(c|pthread|m|dl|rt)\\.so.*").matches(it.name) }.toList()
+        .takeIf { it.isNotEmpty() }
+}
+
+// BUILD-host libc: the glibc the archive was actually compiled against (system for x64, cross for arm64).
+fun buildHostLibc(triple: String): File? {
+    val candidates =
+        if (triple == "linuxArm64") {
+            listOf("/usr/aarch64-linux-gnu/lib/libc.so.6")
+        } else {
+            listOf("/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/x86_64-linux-gnu/libc.so.6", "/lib64/libc.so.6")
+        }
+    return candidates.map { File(it) }.firstOrNull { it.exists() }
+}
+
 fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>> {
     val cap = t.id.replaceFirstChar { it.uppercase() }
     val outDir = projectDir.resolve("libs/boringssl/${t.id}")
@@ -189,11 +254,44 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
             }
         }
 
+    val verify =
+        tasks.register("checkGlibcFloor$cap") {
+            group = "boringssl"
+            description = "Fail if ${t.id}'s archives need a glibc newer than the K/N sysroot floor (RFC §8)."
+            dependsOn(build)
+            doLast {
+                val archives = listOf(outDir.resolve("lib/libcrypto.a"), outDir.resolve("lib/libssl.a"))
+                val external = archiveExternalUndefined(archives)
+                val floorLibs = konanFloorLibs(t.id)
+                val hostLibc = buildHostLibc(t.id)
+                if (floorLibs == null || hostLibc == null) {
+                    // Fallback when the K/N sysroot or the build libc isn't locatable: catch the known
+                    // C23 family by name so a regression of the shim still fails the build.
+                    val bad = external.filter { it.startsWith("__isoc23_") }
+                    if (bad.isNotEmpty()) throw GradleException("glibc-floor violation (${t.id}): ${bad.sorted()} — the __isoc23 compat shim regressed.")
+                    logger.warn("checkGlibcFloor${cap}: K/N sysroot or host libc not found — ran name-based fallback only.")
+                    return@doLast
+                }
+                val floor = floorLibs.flatMap { exportedSymbols(it) }.toSet()
+                val host = exportedSymbols(hostLibc)
+                // Offender = referenced, provided by the build glibc, absent from the floor glibc.
+                val offenders = external.filter { it in host && it !in floor }.sorted()
+                if (offenders.isNotEmpty()) {
+                    throw GradleException(
+                        "glibc-floor violation for ${t.id}: ${offenders} require a glibc newer than the K/N floor " +
+                            "(${floorLibs.first().parentFile.parentFile.name}). Build on an old-glibc base (manylinux2014 / " +
+                            "ubuntu-20.04) or extend the __isoc23 compat shim.",
+                    )
+                }
+                logger.lifecycle("checkGlibcFloor${cap}: OK — ${external.size} external symbols, all within the K/N glibc floor.")
+            }
+        }
+
     val pkg =
         tasks.register("packageBoringSsl$cap") {
             group = "boringssl"
             description = "Package ${t.id} into boringssl-$bundleVersion-${t.id}.tar.gz (+ .sha256, provenance)."
-            dependsOn(build)
+            dependsOn(build, verify)
             doLast {
                 val dist = distDir.get().asFile.apply { mkdirs() }
                 val tarFile = dist.resolve("boringssl-$bundleVersion-${t.id}.tar")

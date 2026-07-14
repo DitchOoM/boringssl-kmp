@@ -171,7 +171,34 @@ Keep the webrtc workflow skeleton (`review` → grep-gate → `build-linux` + `b
 first release — tarball extracts; required headers present; `nm`/`llvm-nm` shows required symbols
 **unprefixed** and **exactly one `libcrypto`**; a throwaway wrapper-`.def` compile+link per K/N triple;
 FFM `SymbolLookup` resolves on JVM; AAR prefab metadata well-formed; a quiche `ffi,qlog` link-smoke
-against the linux tarball; **per-ABI size recorded vs the §5 budget**.
+against the linux tarball; **per-ABI size recorded vs the §5 budget**; and the **glibc-floor gate** ↓.
+
+### 8a. The Linux glibc floor (K/N portability — evidence-backed)
+
+Kotlin/Native links linux consumer binaries against a **bundled, deliberately old glibc sysroot**:
+**glibc 2.19 (linuxX64) / 2.25 (linuxArm64)** (`~/.konan/dependencies/*-glibc-2.19-*`). Any symbol our
+archives reference that the floor libc lacks fails the *consumer's* K/N link. Two real offenders were
+found building on a modern host (glibc 2.39) — this is the "works on CI, breaks for a consumer" trap:
+
+| Symbol | Modern host (≥2.38/2.33) | Floor (2.19) | Source |
+|---|---|---|---|
+| `__isoc23_strtoull` (+ strtol/strtoul/strtoll) | present (C23 redirect) | absent | glibc 2.38 `<stdlib.h>` rewrite |
+| `stat` | `stat@GLIBC_2.33` | absent (only legacy `__xstat`) | glibc 2.33 stat-symbol unification; BoringSSL `by_dir.c` |
+
+**Canonical fix — build on an old glibc, don't shim.** Verified: building the same `stat()` at `-O2`
+on glibc **2.31** emits `__xstat` (in the floor); on glibc 2.39 it emits `stat` (not in the floor). So
+the **release build runs in an old-glibc container** — `manylinux2014` (glibc **2.17**) is the target;
+this eliminates *both* offenders with zero shims. The `__isoc23_*` `ar`-merge shim stays as
+belt-and-suspenders for dev-box builds but is **not** the guarantee. The JVM FFM `.so` wants the same
+manylinux base (it's `dlopen`ed against the host glibc). Android is exempt — it's **bionic via the NDK**
+(floor = `minSdk`/NDK API level, D7=24), no glibc, no `__isoc23`/`stat` issue.
+
+**The gate (implemented in `:boringssl-build:checkGlibcFloor<Triple>`, wired ahead of packaging):** an
+offender is precisely a symbol the *build* glibc provides but the *floor* glibc does not
+(`external_undefined ∩ host_libc − floor_libc`) — not a hand-maintained denylist, so it catches any
+future version-gated symbol while ignoring libgcc/compiler builtins. Fails the build on any offender.
+Alpine/musl is **out of scope**: K/N has no musl target, so `linuxX64/Arm64` binaries are glibc-only
+regardless of BoringSSL (a consumer on Alpine needs `gcompat`).
 
 **Directives kept from webrtc's CLAUDE.md:** "PR states which lanes were runtime-validated vs
 compile-faithful" (Apple/tvOS/watchOS only real on the mac runner). **Dropped** (no runtime data
@@ -216,7 +243,7 @@ Two caveats carried by this pin:
   quiche link-smoke must prove it**, and if it fails, apply the same three patches in `boringssl-build`.
 
 1. Stand up `boringssl-kmp` from the webrtc template; drop js/wasm/benchmark; add `boringssl.native-build`. Set `boringssl = 44b3df6f03d85c901767250329c571db405122d5`, `boringsslApiVersion = 21`, `boringsslQuicheAbi = "quiche 0.29.2 / boring-sys 4.22.0"`.
-2. **Port the Linux path first** (only proven-from-code path): build **both** `libssl.a`+`libcrypto.a`, glibc-floor flags (`-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector`, `__isoc23_strtoull` compat TU `ar`-merged), arm64 via `aarch64-linux-gnu-gcc` `-mno-outline-atomics`. Author `boringssl-jvm` linux FFM `.so` + jextract bindings over `boringssl_shim.h`. Green `validate-artifacts`.
+2. **Port the Linux path first** (only proven-from-code path): build **both** `libssl.a`+`libcrypto.a`, arm64 via `aarch64-linux-gnu-gcc` `-mno-outline-atomics`, `__isoc23` compat shim `ar`-merged (belt-and-suspenders). **DONE + verified** (commits `3e741af`/this step) — both linux triples build, cross-compile, package reproducibly, and the `checkGlibcFloor` gate is wired ahead of packaging. **Open item surfaced by the gate:** host-glibc-2.39 builds reference `stat`/`__isoc23` (above the K/N floor), so the **canonical build must run in an old-glibc container (`manylinux2014`, glibc 2.17)** — see §8a; wiring that container into `:boringssl-build` + CI is the immediate remaining task before consumer-link (step 4). Then author `boringssl-jvm` linux FFM `.so` + jextract bindings over `boringssl_shim.h`. Green `validate-artifacts`.
 3. Ship **0.0.1**: linux tarballs + `boringssl-jvm` (linux slots) + BOM; bake checksums into the plugin; wire the `merged.yaml` Release short-circuit (skip compile if a Release for the commit exists).
 4. Migrate **buffer-crypto (linux only)**: delete inline task, apply the provision plugin, keep `boringsslcrypto.def` **verbatim**. Apple stays CryptoKit/CommonCrypto **untouched**. This is the one real commit change (`63893acb → f1c75347`) — run the wider-surface symbol tests. Release buffer.
 5. Migrate **base `:socket:` (linux)**: swap `LinuxSockets.def` to the provisioned archives (keep `-luring/-lpthread/-ldl`). `nm`-assert one `libcrypto`.
