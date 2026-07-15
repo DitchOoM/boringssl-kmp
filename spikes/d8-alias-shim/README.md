@@ -42,23 +42,36 @@ CI runs both formats in `.github/workflows/spike-d8.yaml` (ubuntu-24.04 = elf, m
 
 ## Result
 
+**✅ PASS on both formats, including asm-defined symbols.**
+
 | Format | Linker mechanism | C symbol (`SHA256`) | asm symbols (`ChaCha20_ctr32`, `sha256_block_data_order`) | Verdict |
 |---|---|---|---|---|
-| **Mach-O** (macos-14 / local arm64) | `ld64 -alias_list` | ✅ KAT | ✅ executed + link-resolved | **PASS** |
-| **ELF** (ubuntu-24.04) | `ld` alias linker script | _see spike-d8.yaml_ | _see spike-d8.yaml_ | _pending CI_ |
+| **Mach-O** (macos-14 + local arm64) | `ld64 -alias_list` (lazy) | ✅ KAT | ✅ executed + link-resolved | **PASS** |
+| **ELF** (ubuntu-24.04) | `ld` `PROVIDE(...)` script + `--whole-archive` | ✅ KAT | ✅ executed + link-resolved | **PASS** |
 
-Prefix at the canonical pin: `b44b3df6f`. Prefixed archive exports e.g. `_b44b3df6f_SHA256_Init`; the
-plain `SHA256_Init` is gone. The plain consumer's undefined `_SHA256` / `_ChaCha20_ctr32` /
-`_sha256_block_data_order` all resolve through the alias table to the prefixed impls.
+Prefix at the canonical pin: `b44b3df6f`. Prefixed archive exports e.g. `b44b3df6f_SHA256_Init`; the
+plain `SHA256_Init` is gone. The plain consumer's undefined `SHA256` / `ChaCha20_ctr32` /
+`sha256_block_data_order` all resolve through the alias table to the prefixed impls.
 
-**Local Mach-O run:**
+**CI runs (identical result both formats):**
 
 ```
 SHA256(abc)=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
-ChaCha20_ctr32 keystream[0..3]=76b8e0ad (asm, plain-aliased)
-&sha256_block_data_order=0x100dba180 (asm, plain-aliased)
+ChaCha20_ctr32 keystream[0..3]=76b8e0ad (asm, plain-aliased)   # RFC 8439 zero-key vector
+&sha256_block_data_order=… (asm, plain-aliased)
 PASS: plain C + plain ASM symbols resolved to the prefixed impls via the alias table
 ```
+
+### Two format-specific gotchas the spike surfaced (and how the adapter must handle them)
+
+1. **ELF eager alias evaluation.** A linker-script `alias = target;` assignment evaluates `target`
+   eagerly, so unreferenced prefixed symbols (not pulled from a lazy archive) error as *"undefined
+   symbol in expression"*. The fix — `PROVIDE(alias = target)` (define only referenced aliases) plus
+   `--whole-archive` on the prefixed lib — is exactly how quiche already consumes the external
+   libcrypto (RFC §6), so it costs the adapter nothing new.
+2. **Mach-O asm underscore.** `boringssl_prefix_symbols_asm.h` prefixes asm symbols through a separate
+   `_a_b` macro because ld/perlasm apply the leading underscore; the alias table is uniform regardless
+   (`_b<hash>_NAME → _NAME`), and ld64's `-alias_list` is lazy so no whole-archive is required.
 
 ## Bearing on the RFC
 
