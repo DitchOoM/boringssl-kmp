@@ -189,15 +189,18 @@ jobs:
           V: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          # Bake the released tarball digests into the provision plugin (no TOFU). boringssl-jvm is
-          # JVM-only (boringsslNativeTargets=false) so publishToMavenLocal needs no native-klib prebuild.
-          ./gradlew :boringssl-provision:bakeChecksums -Pversion="$V" -PchecksumsFile="$PWD/dist/SHA256SUMS" --stacktrace
+          # Publish in ONE invocation, passing -PchecksumsFile so provision:bakeChecksums (wired as a
+          # processResources dependency) bakes the released tarball digests into the plugin jar — no TOFU
+          # (directive #4). NB: it MUST be the same invocation as publishToMavenLocal — a separate bake
+          # run would be re-run without the file here and clobber the resource back to version-only.
+          # boringssl-jvm is JVM-only (boringsslNativeTargets=false) so no native-klib prebuild is needed.
           ./gradlew \
             :boringssl-bom:publishToMavenLocal \
             :boringssl-jvm:publishToMavenLocal \
             :boringssl-android:publishToMavenLocal \
             :boringssl-provision:publishToMavenLocal \
-            -Pversion="$V" --no-configuration-cache --stacktrace
+            -Pversion="$V" -PchecksumsFile="$PWD/dist/SHA256SUMS" \
+            --no-configuration-cache --stacktrace
 
       - name: Collect the boringssl subtree into a bundle layout
         run: |
