@@ -14,4 +14,33 @@ internal interface FfiBackend {
 
     /** SHA-256 of [input], computed by BoringSSL through the FFM downcall. Returns the 32-byte digest. */
     fun sha256(input: ByteArray): ByteArray
+
+    /** SHA-512 of [input]. Returns the 64-byte digest. */
+    fun sha512(input: ByteArray): ByteArray
+
+    /** HMAC-SHA256 of [data] under [key]. Returns the 32-byte MAC. */
+    fun hmacSha256(
+        key: ByteArray,
+        data: ByteArray,
+    ): ByteArray
+
+    /** HKDF-SHA256 (RFC 5869) deriving [length] bytes from [secret] with [salt] and [info]. */
+    fun hkdfSha256(
+        length: Int,
+        secret: ByteArray,
+        salt: ByteArray,
+        info: ByteArray,
+    ): ByteArray
+
+    /** A fresh X25519 key pair: `first` = public, `second` = private (each 32 bytes). */
+    fun x25519KeyPair(): Pair<ByteArray, ByteArray>
+
+    /** X25519 Diffie-Hellman: the 32-byte shared secret of [privateKey] and [peerPublicKey]. */
+    fun x25519(
+        privateKey: ByteArray,
+        peerPublicKey: ByteArray,
+    ): ByteArray
+
+    /** [length] cryptographically secure random bytes from BoringSSL's RNG. */
+    fun randomBytes(length: Int): ByteArray
 }

@@ -1,6 +1,18 @@
 public final class com/ditchoom/boringssl/BoringSsl {
 	public static final field INSTANCE Lcom/ditchoom/boringssl/BoringSsl;
+	public final fun hkdfSha256 (I[B[B[B)[B
+	public static synthetic fun hkdfSha256$default (Lcom/ditchoom/boringssl/BoringSsl;I[B[B[BILjava/lang/Object;)[B
+	public final fun hmacSha256 ([B[B)[B
+	public final fun randomBytes (I)[B
 	public final fun sha256 ([B)[B
+	public final fun sha512 ([B)[B
 	public final fun versionNumber ()J
+	public final fun x25519 ([B[B)[B
+	public final fun x25519KeyPair ()Lcom/ditchoom/boringssl/BoringSsl$X25519KeyPair;
+}
+
+public final class com/ditchoom/boringssl/BoringSsl$X25519KeyPair {
+	public final fun getPrivateKey ()[B
+	public final fun getPublicKey ()[B
 }
 

@@ -77,6 +77,24 @@ val dockerRecipeHash =
     }
 fun imageTag(arch: String) = "ditchoom-boringssl-build:ml2014-$arch-$dockerRecipeHash"
 
+// The FFI shim (boringssl_shim.{h,c} + exports map) is compiled + linked into libboringsslffi.so by
+// the build, but is NOT baked into the container image (it is bind-mounted at /work). It gets its OWN
+// hash, folded into the per-triple build marker below, so growing the shim surface rebuilds the
+// bundle — without needlessly rebuilding the manylinux image.
+// NOTE (optimization): today a shim edit reruns the whole triple, recompiling BoringSSL too, even
+// though only the .so re-link depends on the shim. A future split (a cached `.a` build + a separate
+// shim-keyed `.so` link task) would make shim iteration cheap; see RFC §10.
+val shimHash =
+    run {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        listOf(
+            dockerDir.resolve("boringssl_shim.h"),
+            dockerDir.resolve("boringssl_shim.c"),
+            dockerDir.resolve("boringssl_ffi_exports.map"),
+        ).forEach { if (it.exists()) md.update(it.readBytes()) }
+        md.digest().joinToString("") { "%02x".format(it) }.take(12)
+    }
+
 val dockerUsable =
     !project.hasProperty("noContainer") &&
         try {
@@ -250,9 +268,10 @@ fun buildHostLibc(triple: String): File? {
 fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>> {
     val cap = t.id.replaceFirstChar { it.uppercase() }
     val outDir = projectDir.resolve("libs/boringssl/${t.id}")
-    // Marker keyed on the BoringSSL commit AND the build-recipe hash, so a container/toolchain change
-    // rebuilds. This is the local build cache: onlyIf skips when a matching archive already exists.
-    val marker = outDir.resolve("lib/.built-$boringsslCommit-$dockerRecipeHash")
+    // Marker keyed on the BoringSSL commit, the build-recipe hash, AND the shim hash — so a
+    // container/toolchain change OR a shim-surface change rebuilds. This is the local build cache:
+    // onlyIf skips when a matching bundle already exists.
+    val marker = outDir.resolve("lib/.built-$boringsslCommit-$dockerRecipeHash-$shimHash")
     val crossing = t.crossCc != null && System.getProperty("os.arch") != "aarch64"
 
     val build =
@@ -262,6 +281,7 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
             dependsOn(fetchBoringSsl)
             inputs.property("commit", boringsslCommit)
             inputs.property("recipe", dockerRecipeHash)
+            inputs.property("shim", shimHash)
             inputs.property("container", dockerUsable)
             outputs.dir(outDir)
             outputs.cacheIf { true }

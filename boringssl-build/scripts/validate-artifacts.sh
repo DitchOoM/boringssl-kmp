@@ -86,17 +86,20 @@ fi
 ok "static archives export un-mangled (plain) BoringSSL symbols"
 
 # ── 5. the .so exports ONLY the curated shim; BoringSSL is hidden (D3 single-copy tripwire) ───────
+# Assert the INVARIANT, not a frozen list (the surface grows): every exported text symbol must be a
+# boringssl_ffi_* shim symbol, and there must be at least one. Anything else = a BoringSSL leak.
 so_dynsyms="$("$NM" -D "$SO" 2>/dev/null || true)"
 exported="$(awk '$2=="T"{print $3}' <<<"$so_dynsyms" | sort -u)"
-expected=$'boringssl_ffi_sha256\nboringssl_ffi_version_number'
-if [ "$exported" != "$expected" ]; then
-  fail "libboringsslffi.so exports an unexpected symbol set (BoringSSL leaking?):"$'\n'"$exported"
+[ -n "$exported" ] || fail "libboringsslffi.so exports no text symbols — shim not linked?"
+leaked="$(grep -vE '^boringssl_ffi_' <<<"$exported" || true)"
+if [ -n "$leaked" ]; then
+  fail "libboringsslffi.so exports non-shim symbols (BoringSSL leaking?):"$'\n'"$leaked"
 fi
 # Belt-and-suspenders: a known BoringSSL internal must NOT be dynamically exported.
 if grep -qE ' T (_)?SHA256_Init$' <<<"$so_dynsyms"; then
   fail "libboringsslffi.so exports BoringSSL's SHA256_Init — symbols are NOT hidden (collision risk)"
 fi
-ok "libboringsslffi.so exports only boringssl_ffi_* (BoringSSL hidden)"
+ok "libboringsslffi.so exports only boringssl_ffi_* ($(wc -l <<<"$exported") symbols; BoringSSL hidden)"
 
 # ── 6. size record ───────────────────────────────────────────────────────────────────────────────
 so_bytes="$(stat -c%s "$SO" 2>/dev/null || stat -f%z "$SO")"

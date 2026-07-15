@@ -72,7 +72,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/${{ matrix.triple }}
-          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-boringssl.sh') }}
+          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-boringssl.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map') }}
 
       - name: Build + floor-gate + package (${{ matrix.triple }})
         run: ./gradlew :boringssl-build:${{ matrix.task }} --stacktrace
