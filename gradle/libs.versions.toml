@@ -20,6 +20,10 @@ binaryCompatibilityValidator = "0.18.1"
 boringssl = "44b3df6f03d85c901767250329c571db405122d5"
 boringsslApiVersion = "21"
 boringsslQuicheAbi = "quiche 0.29.2 / boring-sys 4.22.0"
+# Android native floor: the ANDROID_PLATFORM the per-ABI static .a target. MUST match the convention
+# plugin's `minSdk` (24, RFC §5 Rule D / D7). Single source so the native cross-compile and the KMP
+# Android target can never drift apart.
+boringsslAndroidApi = "24"
 
 [libraries]
 # Consumer modules add their own dependencies; nothing shared is needed for the phase-1 skeleton.

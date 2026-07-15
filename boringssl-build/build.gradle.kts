@@ -22,6 +22,9 @@ plugins {
 val catalog = extensions.getByType(VersionCatalogsExtension::class.java).named("libs")
 val boringsslCommit = catalog.findVersion("boringssl").get().requiredVersion
 val boringsslApiVersion = catalog.findVersion("boringsslApiVersion").get().requiredVersion
+// Android ANDROID_PLATFORM floor for the per-ABI static .a — kept in the catalog so it can never drift
+// from the convention plugin's minSdk (RFC §5 Rule D / D7).
+val boringsslAndroidApi = catalog.findVersion("boringsslAndroidApi").get().requiredVersion
 
 // The boringssl-kmp *bundle* version (the release, NOT the BoringSSL commit) — names the tarballs the
 // provision plugin resolves. Overridable with -PboringsslBundleVersion=x; defaults to a dev tag.
@@ -501,9 +504,9 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                 // .so into the single cross-platform MRJAR.
                 val soSrc = outDir.resolve("lib/libboringsslffi.so")
                 if (soSrc.exists()) {
-                    val soOut = dist.resolve("libboringsslffi-$bundleVersion-${t.id}.so")
-                    soSrc.copyTo(soOut, overwrite = true)
-                    dist.resolve("${soOut.name}.sha256").writeText("${sha256Of(soOut)}  ${soOut.name}\n")
+                    val smokeSo = dist.resolve("libboringsslffi-$bundleVersion-${t.id}.so")
+                    soSrc.copyTo(smokeSo, overwrite = true)
+                    dist.resolve("${smokeSo.name}.sha256").writeText("${sha256Of(smokeSo)}  ${smokeSo.name}\n")
                 }
 
                 val digest = sha256Of(tarGz)
@@ -550,6 +553,187 @@ val packageLinux =
             logger.lifecycle("Wrote SHA256SUMS:\n$sums")
         }
     }
+
+// ── Android per-ABI static archives (RFC §5 / §7) ───────────────────────────────────────────────
+// Unlike Linux, Android cross-compiles with the NDK (Bionic, not glibc) — so there is NO manylinux
+// container, NO __isoc23 compat shim, and NO libboringsslffi.so (Android consumers use JNI + a prefab
+// AAR of the static .a, not FFM). ANDROID_PLATFORM=android-$boringsslAndroidApi is the floor, so the
+// NDK toolchain is itself the portability control (the analog of the glibc-floor container). Output is
+// per-ABI static libssl.a/libcrypto.a + headers; :boringssl-android packages them into the prefab AAR.
+data class AndroidAbi(
+    val abi: String, // NDK ABI id, e.g. arm64-v8a — also the libs/ output subdir
+    val suffix: String, // task-name suffix, e.g. Arm64V8a
+    val clangTriple: String, // NDK unified-clang target, e.g. aarch64-linux-android
+)
+
+val androidAbis =
+    listOf(
+        AndroidAbi("arm64-v8a", "Arm64V8a", "aarch64-linux-android"),
+        AndroidAbi("x86_64", "X8664", "x86_64-linux-android"),
+        // armeabi-v7a (32-bit ARM) deliberately dropped — RFC §5 Rule D / D7.
+    )
+
+// Resolve the NDK: ANDROID_NDK_HOME/ROOT, else the highest-versioned ndk/<ver> under the SDK. Returns
+// (ndkDir, version) — version is the directory name (e.g. 28.2.13676358), folded into the build marker
+// + provenance so an NDK bump rebuilds. Null when no NDK is installed (tasks fail with a clear message).
+fun resolveNdk(): Pair<File, String>? {
+    val candidates =
+        buildList {
+            listOf("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT").forEach { e ->
+                System.getenv(e)?.takeIf { it.isNotBlank() }?.let { add(File(it)) }
+            }
+            val sdk =
+                (System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT"))?.let { File(it) }
+                    ?: File(System.getProperty("user.home"), "Android/Sdk").takeIf { it.isDirectory }
+            sdk?.resolve("ndk")?.listFiles { f -> f.isDirectory }?.maxByOrNull { it.name }?.let { add(it) }
+        }
+    val dir = candidates.firstOrNull { File(it, "build/cmake/android.toolchain.cmake").exists() } ?: return null
+    return dir to dir.name
+}
+
+// The host tag under toolchains/llvm/prebuilt (linux-x86_64 on this host); picked by listing so a
+// darwin build host also resolves. clang/llvm-nm live in its bin/.
+fun ndkPrebuilt(ndkDir: File): File =
+    ndkDir.resolve("toolchains/llvm/prebuilt").listFiles { f -> f.isDirectory }?.firstOrNull()
+        ?: throw GradleException("NDK prebuilt toolchain dir not found under $ndkDir")
+
+fun registerAndroidAbi(a: AndroidAbi): Pair<TaskProvider<Task>, TaskProvider<Task>> {
+    val outDir = projectDir.resolve("libs/boringssl/android/${a.abi}")
+    val libDir = outDir.resolve("lib")
+
+    val build =
+        tasks.register("buildBoringSslAndroid${a.suffix}") {
+            group = "boringssl"
+            description = "Cross-compile BoringSSL static libs for Android ${a.abi} (NDK, API $boringsslAndroidApi)."
+            dependsOn(fetchBoringSsl)
+            // The ABI MUST be a declared input: without it both ABI tasks share a build-cache key
+            // (identical commit+api) and Gradle restores one ABI's archives into the other's output dir.
+            inputs.property("abi", a.abi)
+            inputs.property("commit", boringsslCommit)
+            inputs.property("api", boringsslAndroidApi)
+            // Lazy provider (evaluated at execution, not config) so an NDK bump invalidates the cache
+            // without breaking configuration on a machine that has no NDK (returns "none" there).
+            inputs.property("ndk", providers.provider { resolveNdk()?.second ?: "none" })
+            outputs.dir(outDir)
+            outputs.cacheIf { true }
+            doLast {
+                val (ndkDir, ndkVersion) =
+                    resolveNdk() ?: throw GradleException(
+                        "Android build needs an NDK: set ANDROID_NDK_HOME or install one under \$ANDROID_HOME/ndk. " +
+                            "CI provides it via the setup-android action.",
+                    )
+                val marker = libDir.resolve(".android-$boringsslCommit-ndk$ndkVersion-api$boringsslAndroidApi")
+                if (marker.exists() && libDir.resolve("libcrypto.a").exists()) {
+                    logger.lifecycle("Android ${a.abi}: up-to-date ($marker) — skipping.")
+                    return@doLast
+                }
+                val srcDir = boringsslWork.get().dir("src").asFile
+                val cmakeBuildDir = boringsslWork.get().dir("build-android-${a.abi}").asFile
+                    .apply { deleteRecursively(); mkdirs() }
+                // Lean flags so the consumer's --gc-sections drops unreferenced code toward the §5
+                // ≤2.5 MB/ABI budget (measured on the linked subset in :boringssl-android, not here).
+                val leanFlags = "-fvisibility=hidden -ffunction-sections -fdata-sections"
+                logger.lifecycle("Cross-compiling BoringSSL for Android ${a.abi} (NDK $ndkVersion, API $boringsslAndroidApi)...")
+                runOrThrow(
+                    "cmake",
+                    "-DCMAKE_TOOLCHAIN_FILE=${ndkDir.resolve("build/cmake/android.toolchain.cmake").absolutePath}",
+                    "-DANDROID_ABI=${a.abi}", "-DANDROID_PLATFORM=android-$boringsslAndroidApi",
+                    "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+                    "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                    "-DCMAKE_C_FLAGS=$leanFlags", "-DCMAKE_CXX_FLAGS=$leanFlags",
+                    "-G", "Unix Makefiles", srcDir.absolutePath,
+                    dir = cmakeBuildDir, what = "cmake configure android ${a.abi}",
+                )
+                runOrThrow("make", "-j${Runtime.getRuntime().availableProcessors()}", "ssl", "crypto",
+                    dir = cmakeBuildDir, what = "make android ${a.abi}")
+                libDir.mkdirs()
+                val ssl = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libssl.a" }
+                    ?: throw GradleException("libssl.a not found for android ${a.abi}")
+                val crypto = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libcrypto.a" }
+                    ?: throw GradleException("libcrypto.a not found for android ${a.abi}")
+                ssl.copyTo(libDir.resolve("libssl.a"), overwrite = true)
+                crypto.copyTo(libDir.resolve("libcrypto.a"), overwrite = true)
+                val inc = listOf(srcDir.resolve("src/include"), srcDir.resolve("include")).first { it.exists() }
+                inc.copyRecursively(outDir.resolve("include"), overwrite = true)
+
+                require(libDir.resolve("libcrypto.a").exists()) { "libcrypto.a missing after android build ${a.abi}" }
+                // Record raw archive sizes (the §5 budget is enforced on the linked subset in the AAR step).
+                listOf("libcrypto.a", "libssl.a").forEach {
+                    val f = libDir.resolve(it)
+                    logger.lifecycle("  · android/${a.abi}/$it: ${f.length()} bytes (${f.length() / 1024} KiB)")
+                }
+                writeMarker(marker, ".android-", "google/boringssl @ $boringsslCommit ${a.abi} [NDK $ndkVersion, API $boringsslAndroidApi]\n")
+                logger.lifecycle("BoringSSL built for android ${a.abi} → $libDir")
+            }
+        }
+
+    // Android link-smoke: force-load the whole archive into a .so with --no-undefined, targeting the
+    // NDK sysroot at API $boringsslAndroidApi. ANY BoringSSL object referencing a symbol absent from
+    // Bionic-$boringsslAndroidApi fails the link — the Android analog of checkGlibcFloor. Also asserts
+    // the archive exports a PLAIN SHA256_Init (D3 one-unprefixed-copy).
+    val smokeSo = boringsslWork.get().dir("smoke-android-${a.abi}").file("libprobe.so").asFile
+    val smoke =
+        tasks.register("linkSmokeAndroid${a.suffix}") {
+            group = "boringssl"
+            description = "NDK link-smoke: whole-archive link + D3 plain-symbol check for Android ${a.abi}."
+            dependsOn(build)
+            // Up-to-date when the archives are unchanged and the probe .so is present → `check` doesn't
+            // re-link the ~10 MB whole-archive every run.
+            inputs.files(libDir.resolve("libssl.a"), libDir.resolve("libcrypto.a"))
+            outputs.file(smokeSo)
+            doLast {
+                val (ndkDir, _) = resolveNdk() ?: throw GradleException("Android link-smoke needs an NDK (see buildBoringSslAndroid${a.suffix}).")
+                val bin = ndkPrebuilt(ndkDir).resolve("bin")
+                val clang = bin.resolve("clang")
+                val llvmNm = bin.resolve("llvm-nm")
+                val work = smokeSo.parentFile.apply { mkdirs() }
+                val probe = work.resolve("probe.c")
+                probe.writeText(
+                    """
+                    #include <openssl/sha.h>
+                    #include <stddef.h>
+                    /* Reference a real BoringSSL entry point so the archive is genuinely exercised. */
+                    unsigned char boringssl_android_probe(const unsigned char *d, size_t n, unsigned char *out) {
+                        SHA256(d, n, out);
+                        return out[0];
+                    }
+                    """.trimIndent() + "\n",
+                )
+                runOrThrow(
+                    clang.absolutePath, "--target=${a.clangTriple}$boringsslAndroidApi",
+                    "-fPIC", "-shared", "-o", smokeSo.absolutePath,
+                    "-I", outDir.resolve("include").absolutePath, probe.absolutePath,
+                    "-Wl,--no-undefined",
+                    "-Wl,--whole-archive", libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
+                    "-Wl,--no-whole-archive",
+                    dir = work, what = "android link-smoke ${a.abi}",
+                )
+                // D3: the static archive must export SHA256_Init un-mangled (a prefix build renames it).
+                val nmProc = ProcessBuilder(llvmNm.absolutePath, libDir.resolve("libcrypto.a").absolutePath)
+                    .redirectErrorStream(true).start()
+                val nmOut = nmProc.inputStream.bufferedReader().readText(); nmProc.waitFor()
+                if (!Regex("(^| )T _?SHA256_Init$", RegexOption.MULTILINE).containsMatchIn(nmOut)) {
+                    throw GradleException("android ${a.abi}: libcrypto.a does not export a plain SHA256_Init — prefix-mangled or unexpected symbol set.")
+                }
+                logger.lifecycle("android ${a.abi} link-smoke OK: whole-archive links against Bionic-$boringsslAndroidApi (${smokeSo.length() / 1024} KiB) + plain SHA256_Init present.")
+            }
+        }
+    return build to smoke
+}
+
+val androidBuilds = androidAbis.associate { it.abi to registerAndroidAbi(it) }
+
+tasks.register("buildBoringSslAndroid") {
+    group = "boringssl"
+    description = "Cross-compile BoringSSL static libs for all wired Android ABIs (arm64-v8a, x86_64)."
+    dependsOn(androidBuilds.values.map { it.first })
+}
+
+tasks.register("checkBoringSslAndroid") {
+    group = "boringssl"
+    description = "NDK link-smoke every wired Android ABI (whole-archive link + D3 plain-symbol check)."
+    dependsOn(androidBuilds.values.map { it.second })
+}
 
 // `assemble` produces the distributable tarballs.
 tasks.named("assemble") { dependsOn(packageLinux) }

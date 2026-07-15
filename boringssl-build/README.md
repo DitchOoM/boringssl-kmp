@@ -14,13 +14,30 @@ Plain (non-KMP) Gradle project that cross-compiles the **one canonical BoringSSL
 - Every artifact carries a `sha256` + `provenance.json`; the provision plugin bakes the checksums in
   (no TOFU) and fetches by stable direct asset URL.
 
-## Status: Linux REAL; Apple/Android pending (RFC §10)
+## Status: Linux + Android archives REAL; Apple pending (RFC §10)
 
 The **Linux** path is fully implemented: both `linuxX64` and `linuxArm64` build **inside the
 manylinux2014 (glibc 2.17) container** so every archive is Kotlin/Native-floor-safe, and package
-reproducibly. Apple (per-SDK cmake incl. the arm64 iOS-simulator asm-SDK-tag fix) and Android (NDK
-r27, `arm64-v8a` + `x86_64` only per §5 Rule D / D7) arrive in later steps; tvOS/watchOS after the
-step-7 spike proves the cross-compile.
+reproducibly.
+
+The **Android** static-archive path is implemented too: `buildBoringSslAndroid` cross-compiles
+`arm64-v8a` + `x86_64` (only — armeabi-v7a dropped per §5 Rule D / D7) with the **NDK** toolchain
+against `ANDROID_PLATFORM=android-24` (matches the convention plugin's `minSdk`), and
+`checkBoringSslAndroid` runs an NDK **whole-archive link-smoke** against Bionic-24 (the Android analog
+of `checkGlibcFloor`) plus the D3 plain-`SHA256_Init` check. No manylinux container, no `__isoc23`
+shim, no `.so` — Android consumers use JNI + a prefab AAR of the static `.a`. Packaging those archives
+into `:boringssl-android`'s prefab AAR (+ the §5 ≤2.5 MB/ABI budget on the linked subset) is the next
+step.
+
+Apple (per-SDK cmake incl. the arm64 iOS-simulator asm-SDK-tag fix) arrives later; tvOS/watchOS after
+the step-7 spike proves the cross-compile.
+
+### Android tasks
+
+| Task | Does |
+| --- | --- |
+| `buildBoringSslAndroid<Abi>` / `buildBoringSslAndroid` | NDK cross-compile the per-ABI static `libssl.a`/`libcrypto.a` + headers into `libs/boringssl/android/<abi>/` |
+| `linkSmokeAndroid<Abi>` / `checkBoringSslAndroid` | whole-archive link against Bionic-24 (`-Wl,--no-undefined`) + D3 plain-symbol check |
 
 ### Two-stage build per triple (the `.a` / `.so` split)
 

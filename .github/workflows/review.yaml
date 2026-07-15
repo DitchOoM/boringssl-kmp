@@ -70,14 +70,10 @@ jobs:
           echo "TODO step 7 — macos/ios triples; tvOS/watchOS behind the spike (RFC D4)."
 
   build-android:
-    name: "build-android (STUB — step 7)"
     needs: [grep-gate]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - name: "Android prefab placeholder"
-        run: |
-          echo "TODO step 7 — NDK prefab AAR (arm64-v8a, x86_64 only; RFC §5 Rule D)."
+    # REAL: NDK cross-compile arm64-v8a + x86_64 static .a + whole-archive Bionic-24 link-smoke. The
+    # prefab AAR packaging (:boringssl-android) consumes these archives in a follow-up step.
+    uses: ./.github/workflows/build-android.yaml
 
   # Binary-shaped validation of the built Linux bundles (RFC §8). Runs per-triple on the NATIVE-arch
   # runner (mirrors build-linux) so the FFM SymbolLookup smoke exercises each .so on its own arch —
