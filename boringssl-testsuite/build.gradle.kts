@@ -80,3 +80,48 @@ if (knHostSupported) {
         dependsOn(generateSmokeDef)
     }
 }
+
+// ── macosArm64 link-smoke against :boringssl-build's per-SDK Apple archive (RFC §8 / D2) ──
+// The Apple analog of the linuxX64 smoke: statically link the macosArm64 libssl.a/libcrypto.a into a
+// K/N macos test binary and run SHA256. RUNTIME-validated on the macOS runner (not compile-faithful).
+// Registers only on a macOS host, where the convention plugin exposes the macosArm64 K/N target.
+val isMacHost = System.getProperty("os.name").orEmpty().startsWith("Mac", ignoreCase = true)
+if (isMacHost) {
+    val appleTriple = "macosArm64"
+    val appleProvisioned = bsslBuild.projectDir.resolve("libs/boringssl/$appleTriple")
+    val appleArchiveTask = "${bsslBuild.path}:buildBoringSslApple${appleTriple.replaceFirstChar { it.uppercase() }}"
+    val appleBaseDef = layout.projectDirectory.file("src/nativeInterop/cinterop/boringsslsmoke_apple.def")
+    val appleGeneratedDef = layout.buildDirectory.file("generated/cinterop/boringsslsmoke_apple.def")
+
+    val generateSmokeDefApple =
+        tasks.register("generateSmokeDefApple") {
+            dependsOn(appleArchiveTask)
+            inputs.file(appleBaseDef)
+            outputs.file(appleGeneratedDef)
+            doLast {
+                val libDir = appleProvisioned.resolve("lib")
+                val base = appleBaseDef.asFile.readText()
+                val sep = base.indexOf("\n---")
+                require(sep > 0) { "boringsslsmoke_apple.def missing the '---' separator" }
+                val injected =
+                    base.substring(0, sep) +
+                        "\nlibraryPaths = ${libDir.absolutePath}" +
+                        "\nstaticLibraries = libssl.a libcrypto.a\n" +
+                        base.substring(sep)
+                appleGeneratedDef.get().asFile.apply { parentFile.mkdirs(); writeText(injected) }
+            }
+        }
+
+    kotlin {
+        macosArm64 {
+            compilations.getByName("main").cinterops.create("boringsslsmokeApple") {
+                defFile(project.file("build/generated/cinterop/boringsslsmoke_apple.def"))
+                includeDirs(appleProvisioned.resolve("include"))
+            }
+        }
+    }
+
+    tasks.matching { it.name == "cinteropBoringsslsmokeAppleMacosArm64" }.configureEach {
+        dependsOn(generateSmokeDefApple)
+    }
+}
