@@ -40,11 +40,16 @@ jobs:
             echo "::error::committed native binaries found — they must be gitignored and built in CI"
             exit 1
           fi
-      - name: "Exactly ONE BoringSSL commit literal (single-pin)"
+      - name: "BoringSSL commit literals (single-pin, or +1 content-addressed variant when flagged)"
         run: |
           n=$(git grep -hoE '[0-9a-f]{40}' -- gradle/libs.versions.toml | sort -u | wc -l)
-          if [ "$n" -ne 1 ]; then
-            echo "::error::expected exactly one 40-hex boringssl commit in the catalog, found $n"
+          # The canonical `boringssl` pin is the ONE literal by default. A SECOND distinct pin is allowed
+          # only when the content-addressed-variant flag is on (D8): boringsslVariantCommit is then a
+          # sanctioned, prefix-isolated coexisting commit — not accidental drift.
+          max=1
+          if grep -qE '^boringsslPrefix = "true"' gradle/libs.versions.toml; then max=2; fi
+          if [ "$n" -lt 1 ] || [ "$n" -gt "$max" ]; then
+            echo "::error::expected 1 boringssl commit literal (or up to $max with boringsslPrefix=true), found $n"
             exit 1
           fi
       - name: "No BORINGSSL_PREFIX unless catalog-flagged (one-unprefixed-copy invariant)"
