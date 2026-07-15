@@ -196,6 +196,42 @@ fun sha256Of(f: File): String {
     return md.digest().joinToString("") { "%02x".format(it) }
 }
 
+// Portable deterministic tar for the Apple lane (runs on macOS, whose BSD `tar` lacks GNU's
+// --sort/--mtime/--owner). Normalizes every entry's mtime to the fixed epoch (TZ=UTC) and feeds a
+// SORTED relative-path list in `ustar` format — a recipe both bsdtar and GNU tar honour identically, so
+// the archive is byte-stable across the local mac and the macos-14 runner (the Apple analog of the
+// Linux GNU-tar reproducibility recipe). Packs `include` + `lib` under `root`, minus `excludeNames`.
+fun deterministicApplePackage(root: File, tarFile: File, epoch: String, excludeNames: Regex) {
+    val entries =
+        listOf("include", "lib").flatMap { top ->
+            root.resolve(top).walkTopDown()
+                .filter { it.isFile && !excludeNames.matches(it.name) }
+                .map { it.relativeTo(root).path }.toList()
+        }.sorted()
+    require(entries.isNotEmpty()) { "no files to package under $root" }
+    val stamp =
+        java.time.Instant.ofEpochSecond(epoch.toLong()).atZone(java.time.ZoneOffset.UTC)
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMddHHmm.ss"))
+    entries.forEach { rel ->
+        val pb = ProcessBuilder("touch", "-t", stamp, rel).directory(root)
+        pb.environment()["TZ"] = "UTC"
+        if (pb.start().waitFor() != 0) throw GradleException("touch failed normalizing mtime for $rel")
+    }
+    val listFile = tarFile.parentFile.resolve("${tarFile.name}.filelist").apply { writeText(entries.joinToString("\n") + "\n") }
+    try {
+        val pb =
+            ProcessBuilder(
+                "tar", "--format", "ustar", "--uid", "0", "--gid", "0", "--numeric-owner",
+                "-cf", tarFile.absolutePath, "-T", listFile.absolutePath,
+            ).directory(root).redirectErrorStream(true)
+        pb.environment()["TZ"] = "UTC"
+        val code = pb.start().also { it.inputStream.bufferedReader().forEachLine { l -> logger.lifecycle(l) } }.waitFor()
+        if (code != 0) throw GradleException("tar (apple) failed (exit $code) for ${tarFile.name}")
+    } finally {
+        listFile.delete()
+    }
+}
+
 fun runOrThrow(vararg cmd: String, dir: File, what: String) {
     val code = ProcessBuilder(*cmd).directory(dir).redirectErrorStream(true).start()
         .also { it.inputStream.bufferedReader().forEachLine { l -> logger.lifecycle(l) } }.waitFor()
@@ -856,5 +892,323 @@ tasks.register("buildAndroidKat") {
     dependsOn(androidBuilds.values.map { it.third })
 }
 
-// `assemble` produces the distributable tarballs.
-tasks.named("assemble") { dependsOn(packageLinux) }
+// ── Apple per-SDK static archives + FFM dylib (RFC §7 / D2 / D4) ─────────────────────────────────
+// Apple cross-compiles NATIVELY on a macOS runner with Xcode's clang + per-SDK sysroots — no docker,
+// no glibc floor: on Apple the DEPLOYMENT TARGET is the portability floor (K/N links its consumer
+// binaries against it, the analog of the Linux glibc floor / the Android minSdk). Each triple resolves
+// its SDK via `xcrun --sdk <sdk> --show-sdk-path` and cross-compiles with CMAKE_OSX_SYSROOT /
+// _ARCHITECTURES / _DEPLOYMENT_TARGET (+ CMAKE_SYSTEM_NAME for the non-macOS OSes; native Darwin omits
+// it). macOS additionally links the FFM libboringsslffi.dylib for the boringssl-jvm MRJAR; the other
+// triples ship only the K/N static .a (Apple consumers cinterop, not FFM — D2).
+//
+// tvOS/watchOS BoringSSL cross-compile is UNPROVEN (D4): authored + link-smoke-gated here, but marked
+// compile-faithful (proven=false) until a real runner proves the cmake path. iosSimulatorArm64's
+// perlasm objects tag correctly as platform=iOS-simulator under cmake + this pin (verified), so no
+// OPENSSL_NO_ASM workaround is needed for the arm64 simulator.
+data class AppleTriple(
+    val id: String, // konan id / tarball+dir suffix, e.g. macosArm64
+    val sdk: String, // xcrun --sdk arg (macosx | iphoneos | iphonesimulator | appletv* | watch*)
+    val arch: String, // CMAKE_OSX_ARCHITECTURES (x86_64 | arm64)
+    val systemName: String?, // CMAKE_SYSTEM_NAME for iOS/tvOS/watchOS; null → native macOS (Darwin)
+    val minVersion: String, // CMAKE_OSX_DEPLOYMENT_TARGET — the Apple "floor"
+    val clangTarget: String, // -target triple for the link-smoke / dylib (carries min + -simulator tag)
+    val ffiOsArch: String?, // MRJAR <os>-<arch> label iff this triple ships an FFM dylib (macOS only)
+    val proven: Boolean, // false → D4 spike triple (tvOS/watchOS): compile-faithful until proven
+)
+
+val appleTriples =
+    listOf(
+        // ── macOS — runtime-validated on the macOS runner; the only triples that ship an FFM dylib ──
+        AppleTriple("macosX64", "macosx", "x86_64", null, "11.0", "x86_64-apple-macos11.0", "macos-x86_64", true),
+        AppleTriple("macosArm64", "macosx", "arm64", null, "11.0", "arm64-apple-macos11.0", "macos-aarch64", true),
+        // ── iOS device + simulators — device is compile-faithful; simulators run on the macOS runner ──
+        AppleTriple("iosArm64", "iphoneos", "arm64", "iOS", "12.0", "arm64-apple-ios12.0", null, true),
+        AppleTriple("iosSimulatorArm64", "iphonesimulator", "arm64", "iOS", "12.0", "arm64-apple-ios12.0-simulator", null, true),
+        AppleTriple("iosX64", "iphonesimulator", "x86_64", "iOS", "12.0", "x86_64-apple-ios12.0-simulator", null, true),
+        // ── tvOS + watchOS — D4 spike: authored + link-smoke-gated, compile-faithful until proven ──
+        AppleTriple("tvosArm64", "appletvos", "arm64", "tvOS", "12.0", "arm64-apple-tvos12.0", null, false),
+        AppleTriple("tvosSimulatorArm64", "appletvsimulator", "arm64", "tvOS", "12.0", "arm64-apple-tvos12.0-simulator", null, false),
+        AppleTriple("tvosX64", "appletvsimulator", "x86_64", "tvOS", "12.0", "x86_64-apple-tvos12.0-simulator", null, false),
+        AppleTriple("watchosSimulatorArm64", "watchsimulator", "arm64", "watchOS", "7.0", "arm64-apple-watchos7.0-simulator", null, false),
+        AppleTriple("watchosX64", "watchsimulator", "x86_64", "watchOS", "7.0", "x86_64-apple-watchos7.0-simulator", null, false),
+    )
+
+val isMacHost = System.getProperty("os.name").orEmpty().startsWith("Mac", ignoreCase = true)
+
+fun sha12(s: String): String =
+    MessageDigest.getInstance("SHA-256").digest(s.toByteArray()).joinToString("") { "%02x".format(it) }.take(12)
+
+// Xcode/clang toolchain id, folded into the build marker + provenance so an Xcode bump rebuilds. Lazy
+// (execution-time) so configuration never shells out; "none" off a mac keeps config working there.
+fun appleToolchainId(): String =
+    try {
+        execCapture("xcrun", "clang", "--version").lineSequence().firstOrNull()?.let { sha12(it) } ?: "none"
+    } catch (e: Exception) { "none" }
+
+fun xcrunSdkPath(sdk: String): String =
+    execCapture("xcrun", "--sdk", sdk, "--show-sdk-path").also {
+        if (it.isBlank()) throw GradleException("xcrun --sdk $sdk --show-sdk-path returned nothing — is the $sdk SDK installed?")
+    }
+
+fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider<Task>, TaskProvider<Task>> {
+    val cap = t.id.replaceFirstChar { it.uppercase() }
+    val outDir = projectDir.resolve("libs/boringssl/${t.id}")
+    val libDir = outDir.resolve("lib")
+
+    // ── STAGE 1: cmake cross-compile → libssl.a + libcrypto.a + headers ──
+    val build =
+        tasks.register("buildBoringSslApple$cap") {
+            group = "boringssl"
+            description = "Cross-compile BoringSSL static libs (libssl.a + libcrypto.a) for ${t.id} (Xcode/${t.sdk}, min ${t.minVersion})."
+            dependsOn(fetchBoringSsl)
+            // Same inputs discipline as Android: the konan id MUST be an input so two Apple triples never
+            // share a build-cache key (identical commit) and restore each other's archives.
+            inputs.property("triple", t.id)
+            inputs.property("commit", boringsslCommit)
+            inputs.property("min", t.minVersion)
+            inputs.property("xcode", providers.provider { appleToolchainId() })
+            outputs.dir(outDir)
+            outputs.cacheIf { true }
+            doLast {
+                if (!isMacHost) {
+                    throw GradleException("Apple builds require a macOS host with Xcode — CI runs this lane on macos-14.")
+                }
+                val toolId = appleToolchainId()
+                val marker = libDir.resolve(".apple-$boringsslCommit-$toolId-min${t.minVersion}")
+                if (marker.exists() && libDir.resolve("libcrypto.a").exists()) {
+                    logger.lifecycle("Apple ${t.id}: up-to-date ($marker) — skipping.")
+                    return@doLast
+                }
+                val srcDir = boringsslWork.get().dir("src").asFile
+                val sysroot = xcrunSdkPath(t.sdk)
+                val cmakeBuildDir = boringsslWork.get().dir("build-apple-${t.id}").asFile
+                    .apply { deleteRecursively(); mkdirs() }
+                val cmakeArgs =
+                    mutableListOf(
+                        "cmake", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+                        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
+                        "-DCMAKE_OSX_SYSROOT=$sysroot",
+                        "-DCMAKE_OSX_ARCHITECTURES=${t.arch}",
+                        "-DCMAKE_OSX_DEPLOYMENT_TARGET=${t.minVersion}",
+                    )
+                // Non-macOS OSes need CMAKE_SYSTEM_NAME so cmake enters cross mode (and, with a
+                // *simulator* sysroot, tags objects for the simulator). macOS is the native host → omit.
+                if (t.systemName != null) cmakeArgs.add("-DCMAKE_SYSTEM_NAME=${t.systemName}")
+                cmakeArgs.addAll(listOf("-G", "Unix Makefiles", srcDir.absolutePath))
+                logger.lifecycle("Cross-compiling BoringSSL for ${t.id} (${t.sdk}, ${t.arch}, min ${t.minVersion})...")
+                runOrThrow(*cmakeArgs.toTypedArray(), dir = cmakeBuildDir, what = "cmake configure apple ${t.id}")
+                runOrThrow("make", "-j${Runtime.getRuntime().availableProcessors()}", "ssl", "crypto",
+                    dir = cmakeBuildDir, what = "make apple ${t.id}")
+                libDir.mkdirs()
+                val ssl = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libssl.a" }
+                    ?: throw GradleException("libssl.a not found for ${t.id}")
+                val crypto = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libcrypto.a" }
+                    ?: throw GradleException("libcrypto.a not found for ${t.id}")
+                ssl.copyTo(libDir.resolve("libssl.a"), overwrite = true)
+                crypto.copyTo(libDir.resolve("libcrypto.a"), overwrite = true)
+                val inc = listOf(srcDir.resolve("src/include"), srcDir.resolve("include")).first { it.exists() }
+                inc.copyRecursively(outDir.resolve("include"), overwrite = true)
+
+                require(libDir.resolve("libcrypto.a").exists()) { "libcrypto.a missing after apple build ${t.id}" }
+                require(libDir.resolve("libssl.a").exists()) { "libssl.a missing after apple build ${t.id}" }
+                // Archives changed → any previously-linked dylib is stale; drop the ffi marker so the
+                // dylib re-links even if its own inputs (the shim) are unchanged.
+                libDir.listFiles { f -> f.name.startsWith(".ffi-") }?.forEach { it.delete() }
+                listOf("libcrypto.a", "libssl.a").forEach {
+                    val f = libDir.resolve(it)
+                    logger.lifecycle("  · ${t.id}/$it: ${f.length()} bytes (${f.length() / 1024} KiB)")
+                }
+                writeMarker(marker, ".apple-", "google/boringssl @ $boringsslCommit ${t.id} [Xcode $toolId, ${t.sdk}, min ${t.minVersion}]\n")
+                logger.lifecycle("BoringSSL built for ${t.id} → $libDir")
+            }
+        }
+
+    // ── STAGE 2 (macOS only): link the curated shim + archives → libboringsslffi.dylib ──
+    // Mach-O analog of link-ffi.sh: clang -dynamiclib, -fvisibility=hidden, and an EXPORTED-SYMBOLS
+    // LIST (one glob per line, WITH the Mach-O leading underscore) so ONLY the shim's boringssl_ffi_*
+    // symbols leave the dylib — every BoringSSL symbol stays hidden (D3 one-unprefixed-copy). The list
+    // is generated from the same curated surface as the GNU version-script (keyed on shimHash).
+    val ffiMarker = libDir.resolve(".ffi-$boringsslCommit-$shimHash")
+    val linkFfi =
+        tasks.register("linkBoringSslFfiApple$cap") {
+            group = "boringssl"
+            description =
+                if (t.ffiOsArch != null) {
+                    "Link the FFM shim + BoringSSL archives into libboringsslffi.dylib for ${t.id}."
+                } else {
+                    "No-op: ${t.id} ships no FFM dylib (Apple non-macOS consumers use cinterop, not FFM — D2)."
+                }
+            dependsOn(build)
+            inputs.property("commit", boringsslCommit)
+            inputs.property("shim", shimHash)
+            onlyIf { t.ffiOsArch != null && (!ffiMarker.exists() || !libDir.resolve("libboringsslffi.dylib").exists()) }
+            doLast {
+                if (!isMacHost) throw GradleException("Apple FFM dylib link requires a macOS host with Xcode.")
+                require(libDir.resolve("libcrypto.a").exists()) { "libcrypto.a missing — run buildBoringSslApple$cap first" }
+                val shimDir = projectDir.resolve("docker")
+                val sysroot = xcrunSdkPath(t.sdk)
+                val linkWork = boringsslWork.get().dir("link-apple-${t.id}").asFile
+                    .apply { deleteRecursively(); mkdirs() }
+                // Exported-symbols list: the Mach-O leading-underscore form of the GNU version-script's
+                // `boringssl_ffi_*` glob. ld64 honours `*` here just as the version-script does.
+                val exportList = linkWork.resolve("boringssl_ffi_exports.symbols").apply { writeText("_boringssl_ffi_*\n") }
+                val shimO = linkWork.resolve("boringssl_shim.o")
+                val dylib = libDir.resolve("libboringsslffi.dylib")
+                runOrThrow(
+                    "clang", "-c", "-O2", "-fvisibility=hidden",
+                    "-target", t.clangTarget, "-isysroot", sysroot,
+                    "-I", outDir.resolve("include").absolutePath,
+                    shimDir.resolve("boringssl_shim.c").absolutePath, "-o", shimO.absolutePath,
+                    dir = linkWork, what = "compile ffi shim ${t.id}",
+                )
+                runOrThrow(
+                    "clang", "-dynamiclib", "-target", t.clangTarget, "-isysroot", sysroot,
+                    "-fvisibility=hidden", "-o", dylib.absolutePath, shimO.absolutePath,
+                    libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
+                    "-Wl,-exported_symbols_list,${exportList.absolutePath}", "-Wl,-dead_strip",
+                    dir = linkWork, what = "link libboringsslffi.dylib ${t.id}",
+                )
+                runOrThrow("strip", "-x", dylib.absolutePath, dir = linkWork, what = "strip dylib ${t.id}")
+                require(dylib.exists()) { "libboringsslffi.dylib missing after link for ${t.id}" }
+                writeMarker(ffiMarker, ".ffi-", "libboringsslffi.dylib @ $boringsslCommit ${t.id} shim=$shimHash\n")
+                logger.lifecycle("libboringsslffi.dylib linked for ${t.id} → $libDir")
+            }
+        }
+
+    // ── Link-smoke: build a throwaway probe .dylib for the triple's SDK against the .a, exercising a
+    // real BoringSSL entry point. Mach-O defaults to erroring on undefined symbols, so a missing/above
+    // -floor symbol fails the link — the Apple analog of the Android whole-archive Bionic link-smoke /
+    // the K/N glibc floor. Also asserts D3: the archive exports a PLAIN _SHA256_Init. This is the
+    // compile-faithful proof for the device + tvOS/watchOS triples that can't run on the mac runner.
+    val smokeDylib = boringsslWork.get().dir("smoke-apple-${t.id}").file("libprobe.dylib").asFile
+    val smoke =
+        tasks.register("linkSmokeApple$cap") {
+            group = "boringssl"
+            description = "Apple link-smoke: probe .dylib for ${t.id} (${t.sdk}) + D3 plain-symbol check."
+            dependsOn(build)
+            inputs.files(libDir.resolve("libssl.a"), libDir.resolve("libcrypto.a"))
+            outputs.file(smokeDylib)
+            doLast {
+                if (!isMacHost) throw GradleException("Apple link-smoke requires a macOS host with Xcode.")
+                val sysroot = xcrunSdkPath(t.sdk)
+                val work = smokeDylib.parentFile.apply { mkdirs() }
+                val probe = work.resolve("probe.c")
+                probe.writeText(
+                    """
+                    #include <openssl/sha.h>
+                    #include <stddef.h>
+                    /* Reference a real BoringSSL entry point so the archive is genuinely exercised. */
+                    unsigned char boringssl_apple_probe(const unsigned char *d, size_t n, unsigned char *out) {
+                        SHA256(d, n, out);
+                        return out[0];
+                    }
+                    """.trimIndent() + "\n",
+                )
+                runOrThrow(
+                    "clang", "-dynamiclib", "-target", t.clangTarget, "-isysroot", sysroot,
+                    "-I", outDir.resolve("include").absolutePath, probe.absolutePath,
+                    libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
+                    "-o", smokeDylib.absolutePath,
+                    dir = work, what = "apple link-smoke ${t.id}",
+                )
+                // D3: the static archive must export _SHA256_Init un-mangled (a prefix build renames it).
+                val nmProc = ProcessBuilder("nm", libDir.resolve("libcrypto.a").absolutePath)
+                    .redirectErrorStream(true).start()
+                val nmOut = nmProc.inputStream.bufferedReader().readText(); nmProc.waitFor()
+                if (!Regex("(^| )T _SHA256_Init$", RegexOption.MULTILINE).containsMatchIn(nmOut)) {
+                    throw GradleException("apple ${t.id}: libcrypto.a does not export a plain _SHA256_Init — prefix-mangled or unexpected symbol set.")
+                }
+                logger.lifecycle("apple ${t.id} link-smoke OK: probe links against the ${t.sdk} SDK (${smokeDylib.length() / 1024} KiB) + plain _SHA256_Init present.")
+            }
+        }
+
+    val pkg =
+        tasks.register("packageBoringSslApple$cap") {
+            group = "boringssl"
+            description = "Package ${t.id} into boringssl-$bundleVersion-${t.id}.tar.gz (+ .sha256, provenance)."
+            dependsOn(build, linkFfi, smoke)
+            doLast {
+                val dist = distDir.get().asFile.apply { mkdirs() }
+                val tarFile = dist.resolve("boringssl-$bundleVersion-${t.id}.tar")
+                val tarGz = dist.resolve("boringssl-$bundleVersion-${t.id}.tar.gz")
+                tarGz.delete()
+                // Deterministic tar → `gzip -n`. macOS BSD tar lacks GNU's --sort/--mtime/--owner, so
+                // this uses the portable normalize-mtime + sorted-filelist recipe. The FFM dylib +
+                // build markers are excluded (the dylib ships in the boringssl-jvm MRJAR, not the K/N
+                // cinterop bundle).
+                deterministicApplePackage(
+                    outDir, tarFile, sourceDateEpoch,
+                    Regex("""^(libboringsslffi\.dylib|\.apple-.*|\.ffi-.*)$"""),
+                )
+                runOrThrow("gzip", "-nf", tarFile.absolutePath, dir = dist, what = "gzip ${t.id}")
+
+                // Emit the FFM dylib as its own checksummed artifact (macOS only; directive #4). CI
+                // gathers all platforms' shared libs into the single cross-platform MRJAR.
+                val dylibSrc = libDir.resolve("libboringsslffi.dylib")
+                if (t.ffiOsArch != null && dylibSrc.exists()) {
+                    val smokeDy = dist.resolve("libboringsslffi-$bundleVersion-${t.id}.dylib")
+                    dylibSrc.copyTo(smokeDy, overwrite = true)
+                    dist.resolve("${smokeDy.name}.sha256").writeText("${sha256Of(smokeDy)}  ${smokeDy.name}\n")
+                }
+
+                val digest = sha256Of(tarGz)
+                dist.resolve("${tarGz.name}.sha256").writeText("$digest  ${tarGz.name}\n")
+                dist.resolve("boringssl-$bundleVersion-${t.id}.provenance.json").writeText(
+                    """
+                    {
+                      "artifact": "${tarGz.name}",
+                      "sha256": "$digest",
+                      "boringsslCommit": "$boringsslCommit",
+                      "boringsslApiVersion": $boringsslApiVersion,
+                      "quicheAbi": "${catalog.findVersion("boringsslQuicheAbi").get().requiredVersion}",
+                      "triple": "${t.id}",
+                      "appleSdk": "${t.sdk}",
+                      "deploymentTarget": "${t.minVersion}",
+                      "proven": ${t.proven},
+                      "bundleVersion": "$bundleVersion",
+                      "sourceDateEpoch": $sourceDateEpoch
+                    }
+                    """.trimIndent() + "\n",
+                )
+                logger.lifecycle("Packaged ${t.id}: ${tarGz.name}  sha256=$digest")
+            }
+        }
+    return Triple(build, smoke, pkg)
+}
+
+val appleBuilds = appleTriples.associate { it.id to registerAppleTriple(it) }
+
+tasks.register("buildBoringSslApple") {
+    group = "boringssl"
+    description = "Cross-compile BoringSSL static libs for all wired Apple triples (macOS/iOS/tvOS/watchOS)."
+    dependsOn(appleBuilds.values.map { it.first })
+}
+
+tasks.register("checkBoringSslApple") {
+    group = "boringssl"
+    description = "Apple per-SDK link-smoke + D3 plain-symbol check for every wired Apple triple."
+    dependsOn(appleBuilds.values.map { it.second })
+}
+
+val packageApple =
+    tasks.register("packageBoringSslApple") {
+        group = "boringssl"
+        description = "Package all wired Apple triples + write a combined SHA256SUMS."
+        dependsOn(appleBuilds.values.map { it.third })
+        doLast {
+            val dist = distDir.get().asFile
+            val sums = dist.listFiles { f -> f.name.endsWith(".tar.gz") }?.sortedBy { it.name }?.joinToString("") {
+                "${sha256Of(it)}  ${it.name}\n"
+            }.orEmpty()
+            dist.resolve("SHA256SUMS").writeText(sums)
+            logger.lifecycle("Wrote SHA256SUMS:\n$sums")
+        }
+    }
+
+// `assemble` produces the distributable tarballs. Apple rides along only on a macOS host (the Apple
+// tasks require Xcode); Linux/CI runners that invoke a specific packageBoringSsl<Triple> task are
+// unaffected.
+tasks.named("assemble") {
+    dependsOn(packageLinux)
+    if (isMacHost) dependsOn(packageApple)
+}

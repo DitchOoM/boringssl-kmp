@@ -1,0 +1,18 @@
+package = com.ditchoom.boringssl.smoke
+headers = openssl/sha.h
+# Apple K/N auto-links libSystem (pthread + dl live there) — unlike glibc there is NO -lpthread/-ldl to
+# add. The static libssl.a/libcrypto.a need no extra Apple frameworks for the SHA256 smoke surface.
+
+# libraryPaths + staticLibraries (the absolute path to :boringssl-build's per-SDK archive) are injected
+# by the generateSmokeDefApple task — see build.gradle.kts.
+
+---
+
+#include <openssl/sha.h>
+#include <stddef.h>
+
+// static-inline wrapper — the by-design cinterop pattern that forces a concrete, callable symbol
+// (bare header decls / macros don't always materialize bindings). Exercises libcrypto's SHA256.
+static inline void bssl_smoke_sha256(const unsigned char *data, size_t len, unsigned char *out) {
+    SHA256(data, len, out);
+}

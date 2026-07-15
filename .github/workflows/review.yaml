@@ -59,12 +59,12 @@ jobs:
     needs: [grep-gate]
     uses: ./.github/workflows/build-linux.yaml
 
-  # build-apple: DISABLED for now (RFC step 7). The Apple per-SDK cmake cross-compile is authored on a
-  # macOS machine (this CI can't build Apple targets), then this lane is re-enabled to run on macos-14.
-  # Nothing `needs` it, so leaving it off keeps the PR pipeline green on the Linux/Android/JVM lanes.
-  # build-apple:
-  #   needs: [grep-gate]
-  #   uses: ./.github/workflows/build-apple.yaml   # authored in step 7 on macOS
+  # REAL (step 7): per-SDK cmake cross-compile of all 10 Apple triples on macОS runners, each with a
+  # per-SDK link-smoke, plus FFM (macOS x64+arm64) + K/N (macosArm64) RUNTIME KATs and validate-apple.sh.
+  # macOS/simulator/device/tvOS/watchOS runtime-vs-compile-faithful split is documented in build-apple.yaml.
+  build-apple:
+    needs: [grep-gate]
+    uses: ./.github/workflows/build-apple.yaml
 
   build-android:
     needs: [grep-gate]
@@ -76,7 +76,8 @@ jobs:
   # runner (mirrors build-linux) so the FFM SymbolLookup smoke exercises each .so on its own arch —
   # you can't run a linuxArm64 .so on an x64 JVM. The static guards (checksums, headers, nm single-
   # copy) are arch-independent but run here too, close to the artifact. Depends ONLY on build-linux;
-  # the apple/android lanes are stubs and validate-artifacts grows their checks in step 7.
+  # the apple + android lanes self-validate inline (build-apple runs validate-apple.sh + the FFM/K/N
+  # runtime KATs on the macOS runners; build-android runs validate-aar.sh + the emulator/qemu KATs).
   validate-artifacts:
     name: "validate-artifacts (${{ matrix.triple }})"
     needs: [build-linux]
