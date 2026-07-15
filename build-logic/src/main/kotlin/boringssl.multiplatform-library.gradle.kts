@@ -4,7 +4,6 @@
 import com.ditchoom.boringssl.gradle.computeNextVersion
 import org.gradle.api.publish.PublishingExtension
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
-import org.jetbrains.kotlin.konan.target.HostManager
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 // The convention a KMP-shaped boringssl module applies:  plugins { id("boringssl.multiplatform-library") }
@@ -82,6 +81,17 @@ repositories {
     mavenCentral()
 }
 
+// Host detection via System properties, NOT Kotlin/Native's HostManager.host — that throws
+// TargetSupportException("Unknown host target: linux aarch64") on the linux/arm64 CI runner (K/N has no
+// linux-aarch64 HOST target), which failed applying this plugin at configuration time. os.name/os.arch
+// never throw. On a linux-aarch64 host we skip K/N native target registration entirely; jvm{}/android{}
+// still configure, so :boringssl-jvm:jvm21Test (pure JVM) runs there. See :boringssl-testsuite, which
+// guards its own linuxX64 cinterop the same way.
+val hostOsName = System.getProperty("os.name").orEmpty()
+val hostOsArch = System.getProperty("os.arch").orEmpty()
+val isMacHost = hostOsName.startsWith("Mac", ignoreCase = true)
+val knHostSupported = !(hostOsName.startsWith("Linux", ignoreCase = true) && hostOsArch in listOf("aarch64", "arm64"))
+
 kotlin {
     jvmToolchain(21)
 
@@ -101,25 +111,27 @@ kotlin {
         compilerOptions.jvmTarget.set(JvmTarget.JVM_1_8)
     }
     // Apple targets register on macOS hosts only (compile-faithful locally, runtime-validated on the
-    // macOS runner). Linux K/N always registers — the server-side lane and a downstream consumer.
-    // This is the RFC §7 set of 12 K/N triples: linuxX64, linuxArm64 (always) + the 10 Apple triples
-    // below. watchosArm64 (arm64_32) is omitted, exactly as buffer-crypto omits it; Windows/mingw is a
-    // non-target (D6). tvOS/watchOS BoringSSL cross-compile is unproven and gated behind a spike (D4) —
-    // registering the target here is compile-faithful only until step 7 proves the cmake path.
-    if (HostManager.hostIsMac) {
-        macosX64()
-        macosArm64()
-        iosArm64()
-        iosSimulatorArm64()
-        iosX64()
-        tvosArm64()
-        tvosSimulatorArm64()
-        tvosX64()
-        watchosSimulatorArm64()
-        watchosX64()
+    // macOS runner). Linux K/N registers on any K/N-hostable host. This is the RFC §7 set of 12 K/N
+    // triples: linuxX64, linuxArm64 + the 10 Apple triples below. watchosArm64 (arm64_32) is omitted,
+    // exactly as buffer-crypto omits it; Windows/mingw is a non-target (D6). tvOS/watchOS BoringSSL
+    // cross-compile is unproven and gated behind a spike (D4) — registering the target here is
+    // compile-faithful only until step 7 proves the cmake path.
+    if (knHostSupported) {
+        if (isMacHost) {
+            macosX64()
+            macosArm64()
+            iosArm64()
+            iosSimulatorArm64()
+            iosX64()
+            tvosArm64()
+            tvosSimulatorArm64()
+            tvosX64()
+            watchosSimulatorArm64()
+            watchosX64()
+        }
+        linuxX64()
+        linuxArm64()
     }
-    linuxX64()
-    linuxArm64()
 
     applyDefaultHierarchyTemplate()
 

@@ -56,16 +56,27 @@ val generateSmokeDef =
         }
     }
 
-kotlin {
-    linuxX64 {
-        compilations.getByName("main").cinterops.create("boringsslsmoke") {
-            defFile(project.file("build/generated/cinterop/boringsslsmoke.def"))
-            includeDirs(provisioned.resolve("include"))
+// Skip the K/N native target on a linux-aarch64 host: Kotlin/Native has no linux-aarch64 HOST target,
+// so registering linuxX64 there throws at config time (same guard the convention plugin uses). The
+// linuxX64 cinterop link-smoke only runs on an x86_64 host anyway.
+val knHostSupported =
+    !(
+        System.getProperty("os.name").orEmpty().startsWith("Linux", ignoreCase = true) &&
+            System.getProperty("os.arch").orEmpty() in listOf("aarch64", "arm64")
+    )
+
+if (knHostSupported) {
+    kotlin {
+        linuxX64 {
+            compilations.getByName("main").cinterops.create("boringsslsmoke") {
+                defFile(project.file("build/generated/cinterop/boringsslsmoke.def"))
+                includeDirs(provisioned.resolve("include"))
+            }
         }
     }
-}
 
-// The cinterop must see the generated def (and thus the built archive) first.
-tasks.matching { it.name == "cinteropBoringsslsmokeLinuxX64" }.configureEach {
-    dependsOn(generateSmokeDef)
+    // The cinterop must see the generated def (and thus the built archive) first.
+    tasks.matching { it.name == "cinteropBoringsslsmokeLinuxX64" }.configureEach {
+        dependsOn(generateSmokeDef)
+    }
 }
