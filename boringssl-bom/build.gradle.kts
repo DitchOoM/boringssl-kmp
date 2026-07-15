@@ -6,13 +6,13 @@ import org.gradle.api.artifacts.VersionCatalogsExtension
 // records the canonical BoringSSL commit + its quiche ABI anchor, so a consumer imports one platform
 // and gets a coherent set (RFC §7: webrtc-dtls W4 pins the whole matrix via this BOM).
 //
-// Published to Maven Central via vanniktech (the same Central-Portal path as every other module).
+// Published to Maven Central. Gradle produces the UNSIGNED BOM publication into the local maven repo;
+// the release workflow (publish-to-central.yaml) GPG-signs + uploads the bundle to the Central Portal.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 plugins {
     `java-platform`
     alias(libs.plugins.maven.publish)
-    signing
 }
 
 group = "com.ditchoom.boringssl"
@@ -37,24 +37,9 @@ dependencies {
     }
 }
 
-val signingKey = findProperty("signingInMemoryKey")
-val signingPassword = findProperty("signingInMemoryKeyPassword")
-val isMainBranchGithub = System.getenv("GITHUB_REF") == "refs/heads/main"
-val shouldSignAndPublish = isMainBranchGithub && signingKey is String && signingPassword is String
-
-if (shouldSignAndPublish) {
-    signing {
-        useInMemoryPgpKeys(signingKey as String, signingPassword as String)
-    }
-}
-tasks.withType<Sign>().configureEach { onlyIf { shouldSignAndPublish } }
-
 mavenPublishing {
+    // Unsigned local publish; the release workflow owns signing + the Central Portal upload.
     configure(JavaPlatform())
-    if (shouldSignAndPublish) {
-        publishToMavenCentral()
-        signAllPublications()
-    }
     coordinates("com.ditchoom.boringssl", "boringssl-bom", version.toString())
     pom {
         name.set("BoringSSL BOM")

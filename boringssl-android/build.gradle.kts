@@ -17,7 +17,6 @@ import java.util.zip.ZipOutputStream
 
 plugins {
     `maven-publish`
-    alias(libs.plugins.maven.publish)
     signing
 }
 
@@ -128,11 +127,18 @@ val pomName = (findProperty("POM_NAME") as String?)?.takeIf { it.isNotBlank() } 
 val pomDescription = (findProperty("POM_DESCRIPTION") as String?)?.takeIf { it.isNotBlank() }
     ?: error("POM_DESCRIPTION missing for :$name — add it to $name/gradle.properties (Central requires a POM description)")
 
+// Central requires a -sources and -javadoc jar alongside every artifact; a prefab AAR carries only
+// native binaries (no Kotlin/Java source), so ship EMPTY ones to satisfy the validator.
+val emptySourcesJar = tasks.register<Jar>("emptySourcesJar") { archiveClassifier.set("sources") }
+val emptyJavadocJar = tasks.register<Jar>("emptyJavadocJar") { archiveClassifier.set("javadoc") }
+
 publishing {
     publications {
         create<MavenPublication>("prefabAar") {
             artifactId = "boringssl-android"
             artifact(prefabAar)
+            artifact(emptySourcesJar)
+            artifact(emptyJavadocJar)
             pom {
                 name.set(pomName)
                 description.set(pomDescription)
@@ -164,27 +170,7 @@ publishing {
     }
 }
 
-// ── Central-Portal transport (vanniktech) over the hand-rolled AAR publication ──
-// The `prefabAar` publication above is complete (artifact + full POM); vanniktech supplies only the
-// Central-Portal upload + signing, the same path as every other module. Signed Central publish on
-// main-branch CI with the key present; local + PR builds publish unsigned to mavenLocal (same gate).
-val signingKey = findProperty("signingInMemoryKey")
-val signingPassword = findProperty("signingInMemoryKeyPassword")
-val isMainBranchGithub = System.getenv("GITHUB_REF") == "refs/heads/main"
-val shouldSignAndPublish = isMainBranchGithub && signingKey is String && signingPassword is String
-
-if (shouldSignAndPublish) {
-    signing {
-        useInMemoryPgpKeys(signingKey as String, signingPassword as String)
-    }
-}
-tasks.withType<Sign>().configureEach { onlyIf { shouldSignAndPublish } }
-
-mavenPublishing {
-    // No configure()/coordinates() — the `prefabAar` publication is hand-rolled above; vanniktech just
-    // bundles + uploads (and signs) the existing publications to the Central Portal.
-    if (shouldSignAndPublish) {
-        publishToMavenCentral()
-        signAllPublications()
-    }
-}
+// Gradle produces the UNSIGNED prefab-AAR publication into the local maven repo; the release workflow
+// (publish-to-central.yaml) GPG-signs + uploads the bundle to the Central Portal. Disable any Gradle
+// signing so publishToMavenLocal stays unsigned.
+tasks.withType<Sign>().configureEach { enabled = false }

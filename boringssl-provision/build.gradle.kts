@@ -8,10 +8,13 @@ import com.vanniktech.maven.publish.GradlePublishPlugin
 // `boringsslDir(triple) → {include, lib}`. This is the ENTIRE native-consumer surface — a ~10-line
 // swap for today's ~150-line inline cinterop task (RFC §7).
 //
-// Published to **Maven Central + the Gradle Plugin Portal** (RFC §3):
-//   • Maven Central — via vanniktech (the same Central-Portal path the convention modules use), so the
-//     plugin + its marker resolve as a normal dependency and the BOM can pin it.
-//   • Gradle Plugin Portal — via `com.gradle.plugin-publish`, so `plugins { id(...) }` resolves it.
+// Published to **Maven Central** (RFC §3): the plugin jar + its marker so `plugins { id(...) }` resolves
+// from Central (via `pluginManagement { repositories { mavenCentral() } }`) and the BOM can pin it. The
+// Gradle Plugin Portal is a deferred nice-to-have (no Portal secret is configured; `com.gradle.plugin-
+// publish` is applied for the marker publication, not to publish to the Portal).
+//
+// Gradle publishes UNSIGNED to the local maven repo; the release workflow (publish-to-central.yaml)
+// GPG-signs + curl-uploads the bundle to the Central Portal — the shared DitchOoM transport.
 //
 // The release version + baked-in per-triple checksums are supplied by merged.yaml at release time
 // (`-Pversion=<ver>` + `bakeChecksums`), so the shipped plugin verifies downloads with NO trust-on-
@@ -97,34 +100,17 @@ gradlePlugin {
     }
 }
 
-// ── Publishing: Maven Central (vanniktech, the convention modules' Central-Portal path) + signing ──
-// Signed Central publish only on main-branch CI with the key present; local + PR builds publish
-// unsigned to mavenLocal (identical gate to the convention plugin). The Plugin-Portal publish is the
-// separate `publishPlugins` task (com.gradle.plugin-publish), keyed on the Portal secret in merged.yaml.
-val signingKey = findProperty("signingInMemoryKey")
-val signingPassword = findProperty("signingInMemoryKeyPassword")
-val isMainBranchGithub = System.getenv("GITHUB_REF") == "refs/heads/main"
-val shouldSignAndPublish = isMainBranchGithub && signingKey is String && signingPassword is String
-
-if (shouldSignAndPublish) {
-    signing {
-        useInMemoryPgpKeys(signingKey as String, signingPassword as String)
-    }
-}
-
-// com.gradle.plugin-publish eagerly wires a Sign task for the plugin-marker publication; without a key
-// (local + PR builds) it has no signatory and would fail publishToMavenLocal. Gate ALL Sign tasks on
-// the key being present so unsigned local/PR publishing works, exactly like the convention modules.
-tasks.withType<Sign>().configureEach { onlyIf { shouldSignAndPublish } }
+// ── Publishing: UNSIGNED to the local maven repo; the release workflow signs + uploads to Central ──
+// com.gradle.plugin-publish eagerly wires a Sign task for the plugin-marker publication; since signing
+// is owned by publish-to-central.yaml (GPG), disable Gradle signing entirely so publishToMavenLocal
+// produces the clean unsigned bundle the workflow expects.
+tasks.withType<Sign>().configureEach { enabled = false }
 
 mavenPublishing {
-    // java-gradle-plugin project publishing WITH com.gradle.plugin-publish → vanniktech adds the
-    // javadoc/sources jars, signs, and Central-uploads the publications plugin-publish created.
+    // java-gradle-plugin project WITH com.gradle.plugin-publish → publishes the plugin jar + its marker;
+    // vanniktech adds the Central-required sources/javadoc jars + the POM. No publishToMavenCentral()/
+    // signAllPublications() — the release workflow owns signing + the Central Portal upload.
     configure(GradlePublishPlugin())
-    if (shouldSignAndPublish) {
-        publishToMavenCentral()
-        signAllPublications()
-    }
     coordinates("com.ditchoom.boringssl", "boringssl-provision", version.toString())
     pom {
         name.set((findProperty("POM_NAME") as String?) ?: "BoringSSL Provision Plugin")
