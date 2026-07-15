@@ -71,14 +71,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/build/boringssl/src
-          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       # THE big one: restore this triple's built archives; a hit turns the from-source build into a no-op.
       - name: Cache built BoringSSL archives (${{ matrix.triple }})
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/${{ matrix.triple }}
-          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map') }}
+          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map', 'boringssl-build/patches/**') }}
 
       - name: Build + floor-gate + package (${{ matrix.triple }})
         run: |

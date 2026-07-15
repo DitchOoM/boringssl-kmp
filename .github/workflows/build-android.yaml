@@ -56,14 +56,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/build/boringssl/src
-          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       # Restore both ABIs' built archives; a hit turns the from-source cross-compile into a no-op.
       - name: Cache built Android archives
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/android
-          key: bssl-android-${{ hashFiles('gradle/libs.versions.toml') }}-ndk${{ env.NDK_VERSION }}
+          key: bssl-android-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}-ndk${{ env.NDK_VERSION }}
 
       - name: Build + link-smoke + budget + assemble prefab AAR
         # prefabAar transitively runs :boringssl-build:checkBoringSslAndroid (cross-compile both ABIs +
@@ -123,13 +123,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/build/boringssl/src
-          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       - name: Cache built Android archives
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/android
-          key: bssl-android-${{ hashFiles('gradle/libs.versions.toml') }}-ndk${{ env.NDK_VERSION }}
+          key: bssl-android-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}-ndk${{ env.NDK_VERSION }}
 
       - name: Build the x86_64 KAT executable
         run: ./gradlew :boringssl-build:buildAndroidKatX8664 --stacktrace
@@ -184,13 +184,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/build/boringssl/src
-          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       - name: Cache built Android archives
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/android
-          key: bssl-android-${{ hashFiles('gradle/libs.versions.toml') }}-ndk${{ env.NDK_VERSION }}
+          key: bssl-android-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}-ndk${{ env.NDK_VERSION }}
 
       - name: Build the arm64-v8a KAT executable (static)
         run: ./gradlew :boringssl-build:buildAndroidKatArm64V8a --stacktrace
