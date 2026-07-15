@@ -39,7 +39,15 @@ the step-7 spike proves the cross-compile.
 | Task | Does |
 | --- | --- |
 | `buildBoringSslAndroid<Abi>` / `buildBoringSslAndroid` | NDK cross-compile the per-ABI static `libssl.a`/`libcrypto.a` + headers into `libs/boringssl/android/<abi>/` |
-| `linkSmokeAndroid<Abi>` / `checkBoringSslAndroid` | whole-archive link against Bionic-24 (`-Wl,--no-undefined`) + D3 plain-symbol check |
+| `linkSmokeAndroid<Abi>` / `checkBoringSslAndroid` | whole-archive link against Bionic-24 (`-Wl,--no-undefined`) + D3 plain-symbol check + §5 budget gate |
+| `checkAndroidSize<Abi>` | `--gc-sections`+strip link of a representative DTLS+crypto surface; fails past 2.5 MiB/ABI |
+| `buildAndroidKat<Abi>` / `buildAndroidKat` | NDK-build the on-device KAT executable (run on an emulator in CI — the runtime parity check vs `:boringssl-jvm:jvm21Test`) |
+
+**Android verification parity with Linux.** Linux runs the crypto at runtime per-arch (`jvm21Test` on
+each native runner); Android now matches with a **runtime KAT on an x86_64 emulator** (`build-android.yaml`
+→ `android_kat.c`, same FIPS/RFC vectors as the JVM KATs) plus **`validate-aar.sh`** (the Android analog
+of `validate-artifacts.sh`: prefab schema check + a consumer NDK-link against the shipped AAR's extracted
+payload for both ABIs). arm64-v8a runtime awaits an arm64 emulator lane.
 
 ### Two-stage build per triple (the `.a` / `.so` split)
 

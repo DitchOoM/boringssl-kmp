@@ -633,7 +633,7 @@ fun ndkPrebuilt(ndkDir: File): File =
     ndkDir.resolve("toolchains/llvm/prebuilt").listFiles { f -> f.isDirectory }?.firstOrNull()
         ?: throw GradleException("NDK prebuilt toolchain dir not found under $ndkDir")
 
-fun registerAndroidAbi(a: AndroidAbi): Pair<TaskProvider<Task>, List<TaskProvider<Task>>> {
+fun registerAndroidAbi(a: AndroidAbi): Triple<TaskProvider<Task>, List<TaskProvider<Task>>, TaskProvider<Task>> {
     val outDir = projectDir.resolve("libs/boringssl/android/${a.abi}")
     val libDir = outDir.resolve("lib")
 
@@ -790,7 +790,36 @@ fun registerAndroidAbi(a: AndroidAbi): Pair<TaskProvider<Task>, List<TaskProvide
                 }
             }
         }
-    return build to listOf(smoke, size)
+
+    // On-device KAT executable: NDK-compile android_kat.c (statically linked against this ABI's .a) into
+    // a PIE. It is not RUN here (needs an emulator of the target arch) — build-android.yaml pushes it to
+    // an Android emulator and runs it, the runtime parity check vs :boringssl-jvm:jvm21Test.
+    val katSrc = projectDir.resolve("scripts/android_kat.c")
+    val katExe = boringsslWork.get().dir("android-kat/${a.abi}").file("boringssl_kat").asFile
+    val kat =
+        tasks.register("buildAndroidKat${a.suffix}") {
+            group = "boringssl"
+            description = "Build the on-device BoringSSL KAT executable for Android ${a.abi} (run on the emulator in CI)."
+            dependsOn(build)
+            inputs.file(katSrc)
+            inputs.files(libDir.resolve("libssl.a"), libDir.resolve("libcrypto.a"))
+            outputs.file(katExe)
+            doLast {
+                val (ndkDir, _) = resolveNdk() ?: throw GradleException("Android KAT build needs an NDK (see buildBoringSslAndroid${a.suffix}).")
+                val clang = ndkPrebuilt(ndkDir).resolve("bin/clang")
+                katExe.parentFile.mkdirs()
+                runOrThrow(
+                    clang.absolutePath, "--target=${a.clangTriple}$boringsslAndroidApi",
+                    "-O2", "-fPIE", "-pie", "-o", katExe.absolutePath,
+                    "-I", outDir.resolve("include").absolutePath, katSrc.absolutePath,
+                    libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
+                    "-Wl,--no-undefined",
+                    dir = katExe.parentFile, what = "android KAT link ${a.abi}",
+                )
+                logger.lifecycle("android ${a.abi} KAT executable → $katExe (${katExe.length() / 1024} KiB)")
+            }
+        }
+    return Triple(build, listOf(smoke, size), kat)
 }
 
 val androidBuilds = androidAbis.associate { it.abi to registerAndroidAbi(it) }
@@ -805,6 +834,14 @@ tasks.register("checkBoringSslAndroid") {
     group = "boringssl"
     description = "NDK link-smoke + §5 size-budget gate for every wired Android ABI."
     dependsOn(androidBuilds.values.flatMap { it.second })
+}
+
+// Per-ABI on-device KAT executables (built here; RUN on the emulator in build-android.yaml). Also
+// addressable per-ABI as buildAndroidKat<Abi> so CI builds only the arch it will boot.
+tasks.register("buildAndroidKat") {
+    group = "boringssl"
+    description = "Build the on-device BoringSSL KAT executable for every wired Android ABI."
+    dependsOn(androidBuilds.values.map { it.third })
 }
 
 // `assemble` produces the distributable tarballs.
