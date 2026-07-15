@@ -44,10 +44,13 @@ the step-7 spike proves the cross-compile.
 | `buildAndroidKat<Abi>` / `buildAndroidKat` | NDK-build the on-device KAT executable (run on an emulator in CI — the runtime parity check vs `:boringssl-jvm:jvm21Test`) |
 
 **Android verification parity with Linux.** Linux runs the crypto at runtime per-arch (`jvm21Test` on
-each native runner); Android now matches with a **runtime KAT on an x86_64 emulator** (`build-android.yaml`
-→ `android_kat.c`, same FIPS/RFC vectors as the JVM KATs) plus **`validate-aar.sh`** (the Android analog
-of `validate-artifacts.sh`: prefab schema check + a consumer NDK-link against the shipped AAR's extracted
-payload for both ABIs). arm64-v8a runtime awaits an arm64 emulator lane.
+each native runner); Android matches with a **runtime KAT on both ABIs** (`build-android.yaml` →
+`android_kat.c`, same FIPS/RFC vectors as the JVM KATs): **x86_64** on a KVM-accelerated Android
+emulator (full Bionic dynamic runtime), and **arm64-v8a** as a static binary under `qemu-aarch64` on the
+x86_64 runner (executes the aarch64 crypto incl. arm64 asm — no arm64 runner needed). Plus
+**`validate-aar.sh`** (the Android analog of `validate-artifacts.sh`: prefab schema check + a consumer
+NDK-link against the shipped AAR's extracted payload for both ABIs). A native arm64 *emulator* lane
+(full Bionic-on-arm64) remains a possible future upgrade.
 
 ### Two-stage build per triple (the `.a` / `.so` split)
 

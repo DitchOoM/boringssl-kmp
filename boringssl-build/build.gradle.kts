@@ -564,12 +564,17 @@ data class AndroidAbi(
     val abi: String, // NDK ABI id, e.g. arm64-v8a — also the libs/ output subdir
     val suffix: String, // task-name suffix, e.g. Arm64V8a
     val clangTriple: String, // NDK unified-clang target, e.g. aarch64-linux-android
+    // How CI RUNS the on-device KAT for this ABI, which sets the KAT's linkage:
+    //   • x86_64  → dynamic PIE, run on a KVM-accelerated Android emulator (full Bionic runtime).
+    //   • arm64-v8a → STATIC, run under qemu-aarch64 on the x86_64 runner (no arm64 runner / KVM
+    //     needed; a static binary needs no Android loader so qemu-user can execute it directly).
+    val katStatic: Boolean,
 )
 
 val androidAbis =
     listOf(
-        AndroidAbi("arm64-v8a", "Arm64V8a", "aarch64-linux-android"),
-        AndroidAbi("x86_64", "X8664", "x86_64-linux-android"),
+        AndroidAbi("arm64-v8a", "Arm64V8a", "aarch64-linux-android", katStatic = true),
+        AndroidAbi("x86_64", "X8664", "x86_64-linux-android", katStatic = false),
         // armeabi-v7a (32-bit ARM) deliberately dropped — RFC §5 Rule D / D7.
     )
 
@@ -799,24 +804,31 @@ fun registerAndroidAbi(a: AndroidAbi): Triple<TaskProvider<Task>, List<TaskProvi
     val kat =
         tasks.register("buildAndroidKat${a.suffix}") {
             group = "boringssl"
-            description = "Build the on-device BoringSSL KAT executable for Android ${a.abi} (run on the emulator in CI)."
+            description = "Build the on-device BoringSSL KAT executable for Android ${a.abi} (run ${if (a.katStatic) "under qemu-aarch64" else "on the emulator"} in CI)."
             dependsOn(build)
             inputs.file(katSrc)
+            inputs.property("static", a.katStatic)
             inputs.files(libDir.resolve("libssl.a"), libDir.resolve("libcrypto.a"))
             outputs.file(katExe)
             doLast {
                 val (ndkDir, _) = resolveNdk() ?: throw GradleException("Android KAT build needs an NDK (see buildBoringSslAndroid${a.suffix}).")
                 val clang = ndkPrebuilt(ndkDir).resolve("bin/clang")
                 katExe.parentFile.mkdirs()
+                // Static (arm64/qemu) needs no Android loader; dynamic PIE (x86_64/emulator) is the
+                // realistic on-device form. -static implies non-PIE, so the two are mutually exclusive.
+                val linkFlags = if (a.katStatic) listOf("-static") else listOf("-fPIE", "-pie")
                 runOrThrow(
-                    clang.absolutePath, "--target=${a.clangTriple}$boringsslAndroidApi",
-                    "-O2", "-fPIE", "-pie", "-o", katExe.absolutePath,
-                    "-I", outDir.resolve("include").absolutePath, katSrc.absolutePath,
-                    libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
-                    "-Wl,--no-undefined",
+                    *(listOf(clang.absolutePath, "--target=${a.clangTriple}$boringsslAndroidApi", "-O2") +
+                        linkFlags +
+                        listOf(
+                            "-o", katExe.absolutePath,
+                            "-I", outDir.resolve("include").absolutePath, katSrc.absolutePath,
+                            libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
+                            "-Wl,--no-undefined",
+                        )).toTypedArray(),
                     dir = katExe.parentFile, what = "android KAT link ${a.abi}",
                 )
-                logger.lifecycle("android ${a.abi} KAT executable → $katExe (${katExe.length() / 1024} KiB)")
+                logger.lifecycle("android ${a.abi} KAT executable (${if (a.katStatic) "static" else "dynamic"}) → $katExe (${katExe.length() / 1024} KiB)")
             }
         }
     return Triple(build, listOf(smoke, size), kat)
