@@ -112,7 +112,10 @@ while read -r NAME; do
     elf)
       real="${PREFIX}_${NAME}"
       grep -qxF "$real" "$OUT/defined_syms.txt" || continue
-      printf '%s = %s;\n' "$NAME" "$real" >> "$ALIASES"  # ld script: "<alias> = <real>;"
+      # PROVIDE so ONLY referenced aliases are defined (an eager "<alias> = <real>;" would force the
+      # linker to evaluate every <real>, pulling/erroring on unreferenced archive members). Paired with
+      # --whole-archive below (which defines every <real>), this resolves cleanly. ld script format.
+      printf 'PROVIDE(%s = %s);\n' "$NAME" "$real" >> "$ALIASES"
       ;;
   esac
 done < "$OUT/header_names.txt"
@@ -134,9 +137,13 @@ case "$PLATFORM" in
   macho)
     "$CC" "$OUT/consumer.o" "$PREF_LIB" -Wl,-alias_list,"$ALIASES" -o "$OUT/consumer"
     ;;
-  elf)
-    # The alias linker script is passed as an ordinary linker INPUT (additive, not -T which replaces).
-    "$CC" "$OUT/consumer.o" "$PREF_LIB" "$ALIASES" -lpthread -ldl -o "$OUT/consumer"
+    elf)
+    # --whole-archive matches how quiche consumes the external libcrypto (RFC §6): every prefixed
+    # symbol is defined, so the PROVIDE aliases resolve without lazy-extraction gaps. The alias linker
+    # script is passed as an ordinary linker INPUT (additive; not -T, which would REPLACE the script).
+    "$CC" "$OUT/consumer.o" \
+      -Wl,--whole-archive "$PREF_LIB" -Wl,--no-whole-archive \
+      "$ALIASES" -lpthread -ldl -o "$OUT/consumer"
     ;;
 esac
 
