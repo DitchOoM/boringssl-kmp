@@ -14,15 +14,27 @@ Plain (non-KMP) Gradle project that cross-compiles the **one canonical BoringSSL
 - Every artifact carries a `sha256` + `provenance.json`; the provision plugin bakes the checksums in
   (no TOFU) and fetches by stable direct asset URL.
 
-## Status: STUB (migration step 1)
+## Status: Linux REAL; Apple/Android pending (RFC §10)
 
-The cmake cross-compile is **not implemented here yet**. `buildBoringSslLinuxX64` /
-`buildBoringSslLinuxArm64` only log their intent. **Step 2** (RFC §10) fills in the real
-`boringssl.native-build` task factory:
+The **Linux** path is fully implemented: both `linuxX64` and `linuxArm64` build **inside the
+manylinux2014 (glibc 2.17) container** so every archive is Kotlin/Native-floor-safe, and package
+reproducibly. Apple (per-SDK cmake incl. the arm64 iOS-simulator asm-SDK-tag fix) and Android (NDK
+r27, `arm64-v8a` + `x86_64` only per §5 Rule D / D7) arrive in later steps; tvOS/watchOS after the
+step-7 spike proves the cross-compile.
 
-- Linux first (the only proven-from-code path): build **both** `libssl.a` + `libcrypto.a`, glibc-floor
-  flags (`-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector`, the `__isoc23_strtoull` compat
-  TU `ar`-merged), arm64 via `aarch64-linux-gnu-gcc -mno-outline-atomics`.
-- Then Apple (per-SDK cmake incl. the arm64 iOS-simulator asm-SDK-tag fix) and Android
-  (NDK r27, `arm64-v8a` + `x86_64` only per §5 Rule D / D7).
-- tvOS/watchOS only after the step-7 spike proves the cross-compile.
+### Two-stage build per triple (the `.a` / `.so` split)
+
+Each triple builds in two separately-cached stages, so growing the FFI shim surface does **not**
+recompile BoringSSL:
+
+| Stage | Task | Produces | Recipe / marker keyed on |
+| --- | --- | --- | --- |
+| 1 — archives (expensive) | `buildBoringSslArchives<Triple>` | `libssl.a`, `libcrypto.a`, headers | commit + Dockerfile (`imageHash`) + `build-archives.sh` |
+| 2 — FFI link (cheap) | `linkBoringSslFfi<Triple>` | `libboringsslffi.so` | commit + Dockerfile + shim (`boringssl_shim.*` + `boringssl_ffi_exports.map`) + `link-ffi.sh` |
+
+`buildBoringSsl<Triple>` is the umbrella that runs both. A shim-only edit re-runs stage 2 alone (a
+~seconds re-link); a new BoringSSL commit / toolchain / archive-recipe change re-runs stage 1 (and, via
+the ffi marker, forces the relink too). `checkGlibcFloor<Triple>` gates the archives; `packageBoringSsl<Triple>`
+tars the `.a` + headers (lean K/N bundle; the `.so` ships in the boringssl-jvm MRJAR) with sidecar
+checksums + provenance. The corresponding in-container recipes live in `docker/build-archives.sh` and
+`docker/link-ffi.sh`.

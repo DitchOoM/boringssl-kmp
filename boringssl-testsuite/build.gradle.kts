@@ -25,7 +25,9 @@ tasks.matching { it.name == "apiCheck" || it.name == "apiDump" }.configureEach {
 val bsslBuild = project(":boringssl-build")
 val smokeTriple = "linuxX64"
 val provisioned = bsslBuild.projectDir.resolve("libs/boringssl/$smokeTriple")
-val buildArchiveTask = "${bsslBuild.path}:buildBoringSsl${smokeTriple.replaceFirstChar { it.uppercase() }}"
+// Depend on the ARCHIVE stage only — the K/N link-smoke statically links libssl.a/libcrypto.a and
+// never touches libboringsslffi.so, so there's no need to trigger the .so link for this smoke.
+val buildArchiveTask = "${bsslBuild.path}:buildBoringSslArchives${smokeTriple.replaceFirstChar { it.uppercase() }}"
 
 val baseDef = layout.projectDirectory.file("src/nativeInterop/cinterop/boringsslsmoke.def")
 val generatedDef = layout.buildDirectory.file("generated/cinterop/boringsslsmoke.def")

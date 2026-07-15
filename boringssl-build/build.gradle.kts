@@ -64,36 +64,35 @@ val linuxTriples =
     )
 
 // ── Canonical build container (RFC §8a) ─────────────────────────────────────────────────────────
-// The manylinux2014 image is content-addressed by a hash of the Dockerfile + build script, so it is
-// a stable cache entry: built once, reused until the recipe changes.
+// The manylinux2014 image is content-addressed by a hash of the Dockerfile ALONE, so it is a stable
+// cache entry: built once, reused until the toolchain recipe changes. The build scripts are NOT baked
+// into the image (they are bind-mounted at /work), so editing a script must NOT rebuild the image.
 val dockerDir = projectDir.resolve("docker")
-val dockerRecipeHash =
-    run {
-        val md = java.security.MessageDigest.getInstance("SHA-256")
-        listOf(dockerDir.resolve("Dockerfile"), dockerDir.resolve("build-boringssl.sh")).forEach {
-            if (it.exists()) md.update(it.readBytes())
-        }
-        md.digest().joinToString("") { "%02x".format(it) }.take(12)
-    }
-fun imageTag(arch: String) = "ditchoom-boringssl-build:ml2014-$arch-$dockerRecipeHash"
 
-// The FFI shim (boringssl_shim.{h,c} + exports map) is compiled + linked into libboringsslffi.so by
-// the build, but is NOT baked into the container image (it is bind-mounted at /work). It gets its OWN
-// hash, folded into the per-triple build marker below, so growing the shim surface rebuilds the
-// bundle — without needlessly rebuilding the manylinux image.
-// NOTE (optimization): today a shim edit reruns the whole triple, recompiling BoringSSL too, even
-// though only the .so re-link depends on the shim. A future split (a cached `.a` build + a separate
-// shim-keyed `.so` link task) would make shim iteration cheap; see RFC §10.
+fun hashFiles(vararg files: File): String {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    files.forEach { if (it.exists()) md.update(it.readBytes()) }
+    return md.digest().joinToString("") { "%02x".format(it) }.take(12)
+}
+
+// Image content = the Dockerfile only → the image tag / cache key.
+val imageHash = hashFiles(dockerDir.resolve("Dockerfile"))
+fun imageTag(arch: String) = "ditchoom-boringssl-build:ml2014-$arch-$imageHash"
+
+// ── Two decoupled build recipes (this is the .a/.so split — RFC §10) ─────────────────────────────
+// The expensive static-archive build (build-archives.sh: compiles all of BoringSSL) and the cheap
+// FFI re-link (link-ffi.sh: shim → libboringsslffi.so) are keyed on SEPARATE hashes, so a shim edit
+// re-links only the .so instead of recompiling BoringSSL. See the two markers in registerTriple().
+//   • archiveRecipeHash — the .a build recipe (independent of the shim surface).
+//   • shimHash          — the curated shim surface + the .so link recipe.
+val archiveRecipeHash = hashFiles(dockerDir.resolve("build-archives.sh"))
 val shimHash =
-    run {
-        val md = java.security.MessageDigest.getInstance("SHA-256")
-        listOf(
-            dockerDir.resolve("boringssl_shim.h"),
-            dockerDir.resolve("boringssl_shim.c"),
-            dockerDir.resolve("boringssl_ffi_exports.map"),
-        ).forEach { if (it.exists()) md.update(it.readBytes()) }
-        md.digest().joinToString("") { "%02x".format(it) }.take(12)
-    }
+    hashFiles(
+        dockerDir.resolve("boringssl_shim.h"),
+        dockerDir.resolve("boringssl_shim.c"),
+        dockerDir.resolve("boringssl_ffi_exports.map"),
+        dockerDir.resolve("link-ffi.sh"),
+    )
 
 val dockerUsable =
     !project.hasProperty("noContainer") &&
@@ -200,6 +199,14 @@ fun runOrThrow(vararg cmd: String, dir: File, what: String) {
     if (code != 0) throw GradleException("$what failed (exit $code): ${cmd.joinToString(" ")}")
 }
 
+// Write a build marker, first deleting any stale siblings sharing its prefix, so EXACTLY ONE marker
+// with a given prefix ever exists. This keeps the `onlyIf` short-circuit honest: reverting an input
+// (e.g. undoing a shim edit) leaves no stale marker to wrongly skip the re-link.
+fun writeMarker(marker: File, prefix: String, content: String) {
+    marker.parentFile?.listFiles { f -> f.name.startsWith(prefix) && f != marker }?.forEach { it.delete() }
+    marker.writeText(content)
+}
+
 // ── glibc-floor gate (RFC §8) ─────────────────────────────────────────────────────────────────────
 // K/N links linux consumer binaries against a bundled OLD glibc sysroot (2.19 x64 / 2.25 arm64). Any
 // symbol our archives need that the FLOOR libc lacks fails the consumer's K/N link (that's what the
@@ -268,26 +275,28 @@ fun buildHostLibc(triple: String): File? {
 fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>> {
     val cap = t.id.replaceFirstChar { it.uppercase() }
     val outDir = projectDir.resolve("libs/boringssl/${t.id}")
-    // Marker keyed on the BoringSSL commit, the build-recipe hash, AND the shim hash — so a
-    // container/toolchain change OR a shim-surface change rebuilds. This is the local build cache:
-    // onlyIf skips when a matching bundle already exists.
-    val marker = outDir.resolve("lib/.built-$boringsslCommit-$dockerRecipeHash-$shimHash")
+    // The .a build and the .so re-link are keyed on SEPARATE markers so a shim edit re-links only the
+    // .so (see RFC §10). Both fold in the commit + image (toolchain) hash; the archive marker adds the
+    // archive recipe, and the ffi marker adds the archive recipe AND the shim hash (a new commit /
+    // toolchain / archive-recipe rebuilds the .a AND forces a relink; a shim edit forces only a relink).
+    val archiveMarker = outDir.resolve("lib/.archives-$boringsslCommit-$imageHash-$archiveRecipeHash")
+    val ffiMarker = outDir.resolve("lib/.ffi-$boringsslCommit-$imageHash-$archiveRecipeHash-$shimHash")
     val crossing = t.crossCc != null && System.getProperty("os.arch") != "aarch64"
+    val libDir = outDir.resolve("lib")
 
-    val build =
-        tasks.register("buildBoringSsl$cap") {
+    // ── STAGE 1 (expensive): compile all of BoringSSL → libssl.a + libcrypto.a + headers ──
+    val buildArchives =
+        tasks.register("buildBoringSslArchives$cap") {
             group = "boringssl"
-            description = "Build BoringSSL static libs (libssl.a + libcrypto.a) + headers for ${t.id}."
+            description = "Compile BoringSSL static libs (libssl.a + libcrypto.a) + headers for ${t.id}."
             dependsOn(fetchBoringSsl)
             inputs.property("commit", boringsslCommit)
-            inputs.property("recipe", dockerRecipeHash)
-            inputs.property("shim", shimHash)
+            inputs.property("image", imageHash)
+            inputs.property("archiveRecipe", archiveRecipeHash)
             inputs.property("container", dockerUsable)
             outputs.dir(outDir)
             outputs.cacheIf { true }
-            // Rebuild if the archives are stale OR the FFM shared lib is absent (so adding the .so
-            // step re-triggers a triple whose .a were already cached from an earlier recipe).
-            onlyIf { !marker.exists() || !outDir.resolve("lib/libboringsslffi.so").exists() }
+            onlyIf { !archiveMarker.exists() || !libDir.resolve("libcrypto.a").exists() }
             doLast {
                 val srcDir = boringsslWork.get().dir("src").asFile
                 val cFlags = t.extraCFlags.joinToString(" ")
@@ -298,13 +307,13 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                     ensureImage(t.dockerArch, t.dockerPlatform, tag)
                     val uid = execCapture("id", "-u")
                     val gid = execCapture("id", "-g")
-                    logger.lifecycle("Building BoringSSL for ${t.id} in $tag (glibc 2.17)...")
+                    logger.lifecycle("Building BoringSSL archives for ${t.id} in $tag (glibc 2.17)...")
                     runOrThrow(
                         "docker", "run", "--rm", "--platform", t.dockerPlatform,
                         "--user", "$uid:$gid", "-e", "HOME=/tmp", "-e", "CFLAGS=$cFlags", "-e", "CC=cc",
                         "-v", "${rootDir.absolutePath}:/work",
-                        tag, "/work/boringssl-build/docker/build-boringssl.sh", t.id,
-                        dir = projectDir, what = "container build ${t.id}",
+                        tag, "/work/boringssl-build/docker/build-archives.sh", t.id,
+                        dir = projectDir, what = "container archive build ${t.id}",
                     )
                 } else {
                     // ── DEV FALLBACK (-PnoContainer or no docker): host build. NOT glibc-floor-safe on a
@@ -330,58 +339,110 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                     runOrThrow(*cmakeArgs.toTypedArray(), dir = cmakeBuildDir, what = "cmake configure ${t.id}")
                     runOrThrow("make", "-j${Runtime.getRuntime().availableProcessors()}", "ssl", "crypto",
                         dir = cmakeBuildDir, what = "make ${t.id}")
-                    outDir.resolve("lib").mkdirs()
+                    libDir.mkdirs()
                     val ssl = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libssl.a" }
                         ?: throw GradleException("libssl.a not found for ${t.id}")
                     val crypto = cmakeBuildDir.walkTopDown().firstOrNull { it.name == "libcrypto.a" }
                         ?: throw GradleException("libcrypto.a not found for ${t.id}")
-                    ssl.copyTo(outDir.resolve("lib/libssl.a"), overwrite = true)
-                    crypto.copyTo(outDir.resolve("lib/libcrypto.a"), overwrite = true)
+                    ssl.copyTo(libDir.resolve("libssl.a"), overwrite = true)
+                    crypto.copyTo(libDir.resolve("libcrypto.a"), overwrite = true)
                     val compatC = cmakeBuildDir.resolve("isoc23_compat.c").apply { writeText(isoC23CompatSource) }
                     val compatO = cmakeBuildDir.resolve("isoc23_compat.o")
                     val cc = t.crossCc ?: "cc"
                     runOrThrow(cc, "-c", "-fPIC", "-O2", compatC.absolutePath, "-o", compatO.absolutePath,
                         dir = cmakeBuildDir, what = "compile isoc23 compat ${t.id}")
-                    runOrThrow("ar", "r", outDir.resolve("lib/libcrypto.a").absolutePath, compatO.absolutePath,
+                    runOrThrow("ar", "r", libDir.resolve("libcrypto.a").absolutePath, compatO.absolutePath,
                         dir = cmakeBuildDir, what = "ar-merge isoc23 compat ${t.id}")
                     val inc = listOf(srcDir.resolve("src/include"), srcDir.resolve("include")).first { it.exists() }
                     inc.copyRecursively(outDir.resolve("include"), overwrite = true)
+                }
 
-                    // libboringsslffi.so (host fallback; mirrors docker/build-boringssl.sh). Only the
-                    // shim's boringssl_ffi_* symbols are exported; BoringSSL stays hidden (D3). NOT
+                require(libDir.resolve("libcrypto.a").exists()) { "libcrypto.a missing after build for ${t.id}" }
+                require(libDir.resolve("libssl.a").exists()) { "libssl.a missing after build for ${t.id}" }
+                // The archives changed → any previously-linked .so is stale; drop ALL ffi markers so
+                // the ffi task re-links even if its own inputs (the shim) are unchanged.
+                libDir.listFiles { f -> f.name.startsWith(".ffi-") }?.forEach { it.delete() }
+                writeMarker(archiveMarker, ".archives-", "google/boringssl @ $boringsslCommit (API v$boringsslApiVersion) ${t.id} archives [${if (dockerUsable) "container:manylinux2014" else "host"}]\n")
+                logger.lifecycle("BoringSSL archives built for ${t.id} → $libDir")
+            }
+        }
+
+    // ── STAGE 2 (cheap): link the curated shim + the static archives → libboringsslffi.so ──
+    // Keyed on the shim hash, NOT the archive recipe: editing the shim re-links only the .so and does
+    // NOT recompile BoringSSL. Depends on the archives so the .a exist first.
+    val linkFfi =
+        tasks.register("linkBoringSslFfi$cap") {
+            group = "boringssl"
+            description = "Link the FFI shim + BoringSSL archives into libboringsslffi.so for ${t.id}."
+            dependsOn(buildArchives)
+            inputs.property("commit", boringsslCommit)
+            inputs.property("image", imageHash)
+            inputs.property("shim", shimHash)
+            inputs.property("container", dockerUsable)
+            outputs.file(libDir.resolve("libboringsslffi.so"))
+            onlyIf { !ffiMarker.exists() || !libDir.resolve("libboringsslffi.so").exists() }
+            doLast {
+                require(libDir.resolve("libcrypto.a").exists()) { "libcrypto.a missing — run buildBoringSslArchives$cap first" }
+
+                if (dockerUsable) {
+                    val tag = imageTag(t.dockerArch)
+                    ensureImage(t.dockerArch, t.dockerPlatform, tag)
+                    val uid = execCapture("id", "-u")
+                    val gid = execCapture("id", "-g")
+                    logger.lifecycle("Linking libboringsslffi.so for ${t.id} in $tag (glibc 2.17)...")
+                    runOrThrow(
+                        "docker", "run", "--rm", "--platform", t.dockerPlatform,
+                        "--user", "$uid:$gid", "-e", "HOME=/tmp", "-e", "CC=cc",
+                        "-v", "${rootDir.absolutePath}:/work",
+                        tag, "/work/boringssl-build/docker/link-ffi.sh", t.id,
+                        dir = projectDir, what = "container ffi link ${t.id}",
+                    )
+                } else {
+                    // libboringsslffi.so (host fallback; mirrors docker/link-ffi.sh). Only the shim's
+                    // boringssl_ffi_* symbols are exported; BoringSSL stays hidden (D3). NOT
                     // glibc-floor-safe on a modern host — dev iteration only, same caveat as the .a.
                     val shimDir = projectDir.resolve("docker")
                     val ffiCc = t.crossCc ?: "cc"
-                    val shimO = cmakeBuildDir.resolve("boringssl_shim.o")
+                    val linkWork = boringsslWork.get().dir("link-${t.id}").asFile
+                        .apply { deleteRecursively(); mkdirs() }
+                    val shimO = linkWork.resolve("boringssl_shim.o")
                     runOrThrow(
                         ffiCc, "-c", "-fPIC", "-O2", "-fvisibility=hidden",
                         "-I", outDir.resolve("include").absolutePath,
                         shimDir.resolve("boringssl_shim.c").absolutePath, "-o", shimO.absolutePath,
-                        dir = cmakeBuildDir, what = "compile ffi shim ${t.id}",
+                        dir = linkWork, what = "compile ffi shim ${t.id}",
                     )
                     runOrThrow(
-                        ffiCc, "-shared", "-fPIC", "-o", outDir.resolve("lib/libboringsslffi.so").absolutePath,
+                        ffiCc, "-shared", "-fPIC", "-o", libDir.resolve("libboringsslffi.so").absolutePath,
                         shimO.absolutePath,
-                        outDir.resolve("lib/libssl.a").absolutePath, outDir.resolve("lib/libcrypto.a").absolutePath,
+                        libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
                         "-Wl,--exclude-libs,ALL",
                         "-Wl,--version-script=${shimDir.resolve("boringssl_ffi_exports.map").absolutePath}",
                         "-Wl,--gc-sections", "-lpthread",
-                        dir = cmakeBuildDir, what = "link libboringsslffi.so ${t.id}",
+                        dir = linkWork, what = "link libboringsslffi.so ${t.id}",
                     )
                 }
 
-                require(outDir.resolve("lib/libcrypto.a").exists()) { "libcrypto.a missing after build for ${t.id}" }
-                require(outDir.resolve("lib/libboringsslffi.so").exists()) { "libboringsslffi.so missing after build for ${t.id}" }
-                marker.writeText("google/boringssl @ $boringsslCommit (API v$boringsslApiVersion) ${t.id} [${if (dockerUsable) "container:manylinux2014" else "host"}]\n")
-                logger.lifecycle("BoringSSL built for ${t.id} → ${outDir.resolve("lib")}")
+                require(libDir.resolve("libboringsslffi.so").exists()) { "libboringsslffi.so missing after link for ${t.id}" }
+                writeMarker(ffiMarker, ".ffi-", "libboringsslffi.so @ $boringsslCommit ${t.id} shim=$shimHash [${if (dockerUsable) "container:manylinux2014" else "host"}]\n")
+                logger.lifecycle("libboringsslffi.so linked for ${t.id} → $libDir")
             }
+        }
+
+    // Umbrella: the full per-triple build (archives + .so). Kept as `buildBoringSsl<Triple>` so the
+    // aggregate tasks, testsuite, and docs keep a single stable entry point.
+    val build =
+        tasks.register("buildBoringSsl$cap") {
+            group = "boringssl"
+            description = "Build BoringSSL archives + libboringsslffi.so for ${t.id}."
+            dependsOn(buildArchives, linkFfi)
         }
 
     val verify =
         tasks.register("checkGlibcFloor$cap") {
             group = "boringssl"
             description = "Fail if ${t.id}'s archives need a glibc newer than the K/N sysroot floor (RFC §8)."
-            dependsOn(build)
+            dependsOn(buildArchives)
             doLast {
                 val archives = listOf(outDir.resolve("lib/libcrypto.a"), outDir.resolve("lib/libssl.a"))
                 val external = archiveExternalUndefined(archives)
@@ -429,6 +490,7 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                 runOrThrow(
                     "tar", "--sort=name", "--mtime=@$sourceDateEpoch",
                     "--owner=0", "--group=0", "--numeric-owner", "--exclude=libboringsslffi.so",
+                    "--exclude=.archives-*", "--exclude=.ffi-*",
                     "-cf", tarFile.absolutePath, "-C", outDir.absolutePath, "include", "lib",
                     dir = dist, what = "tar ${t.id}",
                 )
