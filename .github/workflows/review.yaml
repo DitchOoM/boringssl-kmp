@@ -7,7 +7,7 @@
 #       - no committed binaries (*.a/*.so/*.dylib/tarballs)
 #       - exactly ONE `boringssl` 40-hex commit literal in the tree (the single-pin directive)
 #       - no `BORINGSSL_PREFIX` unless catalog-flagged (one-unprefixed-copy invariant)
-#     → build-linux  +  build-apple  +  build-android      (per-triple cmake, the RFC §7 matrix)
+#     → build-linux  +  build-android  (+ build-apple, DISABLED until step 7 — authored on macOS)
 #     → validate-artifacts  (binary-shaped, RFC §8: tarball extracts; required headers present;
 #         nm/llvm-nm shows required symbols UNPREFIXED and exactly one libcrypto; a throwaway
 #         wrapper-.def compile+link per K/N triple; FFM SymbolLookup resolves on JVM; AAR prefab
@@ -59,15 +59,12 @@ jobs:
     needs: [grep-gate]
     uses: ./.github/workflows/build-linux.yaml
 
-  build-apple:
-    name: "build-apple (STUB — step 7)"
-    needs: [grep-gate]
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v6
-      - name: "Apple triples placeholder"
-        run: |
-          echo "TODO step 7 — macos/ios triples; tvOS/watchOS behind the spike (RFC D4)."
+  # build-apple: DISABLED for now (RFC step 7). The Apple per-SDK cmake cross-compile is authored on a
+  # macOS machine (this CI can't build Apple targets), then this lane is re-enabled to run on macos-14.
+  # Nothing `needs` it, so leaving it off keeps the PR pipeline green on the Linux/Android/JVM lanes.
+  # build-apple:
+  #   needs: [grep-gate]
+  #   uses: ./.github/workflows/build-apple.yaml   # authored in step 7 on macOS
 
   build-android:
     needs: [grep-gate]
