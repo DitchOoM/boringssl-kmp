@@ -17,7 +17,13 @@
 name: "Build & Package (Linux)"
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      bundle_version:
+        description: "boringsslBundleVersion stamped into the release tarball names (default: the dev tag)."
+        required: false
+        type: string
+        default: ""
   workflow_dispatch: {}
 
 concurrency:
@@ -75,7 +81,10 @@ jobs:
           key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map') }}
 
       - name: Build + floor-gate + package (${{ matrix.triple }})
-        run: ./gradlew :boringssl-build:${{ matrix.task }} --stacktrace
+        run: |
+          ARGS=""
+          [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
+          ./gradlew :boringssl-build:${{ matrix.task }} $ARGS --stacktrace
 
       - name: Upload ${{ matrix.triple }} bundle
         uses: actions/upload-artifact@v4

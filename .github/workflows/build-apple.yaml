@@ -26,7 +26,13 @@
 name: "Build & Package (Apple)"
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      bundle_version:
+        description: "boringsslBundleVersion stamped into the release tarball names (default: the dev tag)."
+        required: false
+        type: string
+        default: ""
   workflow_dispatch: {}
 
 concurrency:
@@ -96,7 +102,10 @@ jobs:
 
       # Build + per-SDK link-smoke + package (the pkg task dependsOn build + linkFfi + smoke).
       - name: Build + link-smoke + package (${{ matrix.triple }})
-        run: ./gradlew :boringssl-build:packageBoringSslApple${{ matrix.cap }} --stacktrace
+        run: |
+          ARGS=""
+          [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
+          ./gradlew :boringssl-build:packageBoringSslApple${{ matrix.cap }} $ARGS --stacktrace
 
       # Binary-shaped guards: checksums, extract, headers, exactly-one-libcrypto, un-mangled statics,
       # and (macOS) the dylib single-copy symbol-hiding check.

@@ -24,6 +24,11 @@ tasks.matching { it.name.endsWith("ApiCheck") || it.name.endsWith("ApiDump") }.c
     enabled = false
 }
 
+// Not a published artifact (RFC §3: testsuite is [not published]). The convention plugin wires
+// mavenPublishing for every module it applies to; disable ALL publish tasks here so the release
+// pipeline can never accidentally ship the link-smoke harness to Central.
+tasks.matching { it.name.startsWith("publish") }.configureEach { enabled = false }
+
 // ── linuxX64 link-smoke against :boringssl-build's container-built archive ──
 val bsslBuild = project(":boringssl-build")
 val smokeTriple = "linuxX64"

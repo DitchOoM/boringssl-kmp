@@ -1,19 +1,24 @@
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-# Release pipeline (RFC §8) — PLACEHOLDER / STUB. Migration step 1 only wires the shape.
+# Release pipeline (RFC §8 / §10 step 3) — label-driven, on push to main.
 #
-# Intended shape (RFC §8, label-driven — kept from the webrtc skeleton):
-#   on push to main → version bump from PR labels (`major` / `minor`, else patch;
-#       `skip-release` / `draft-release` alter the flow)
-#     → build-linux + build-apple + build-android
-#     → validate-artifacts (binary-shaped — see review.yaml)
-#     → publish:
-#         - small artifacts (boringssl-provision, -jvm, -android, -bom) → Maven Central (+ Plugin Portal
-#           for the provision plugin)
-#         - heavy static tarballs (boringssl-<ver>-<triple>.tar.gz + .sha256 + SHA256SUMS + provenance)
-#           → GitHub Releases   (never LFS / Packages / Central for the blobs — RFC §3 channel split)
-#     → finalize: tag + GitHub Release; release notes STATE the canonical commit + quiche ABI anchor.
-#   Release short-circuit: skip the compile if a Release for the canonical commit already exists.
-#   Retargeted watchers: native-deps-freshness + weekly-dependency-update track the quiche ABI anchor.
+#   plan            derive the version + flags from the merged PR's labels:
+#                     • skip-release      → do nothing (the whole run short-circuits)
+#                     • draft-release     → build + create a DRAFT GitHub Release, do NOT publish to Central
+#                     • major / minor     → -PincrementMajor / -PincrementMinor (else patch)
+#                   also short-circuits if a Release for the computed tag already exists.
+#     ├─ build-linux / build-apple / build-android   (reusable lanes, stamped with -PboringsslBundleVersion)
+#     ├─ github-release   heavy static tarballs (+ .sha256 + SHA256SUMS + provenance) → GitHub Releases
+#     │                   (RFC §3 channel split); notes STATE the canonical commit + quiche ABI anchor.
+#     └─ publish-central  small artifacts → Maven Central (jvm MRJAR, android AAR, bom, provision) +
+#                         the provision plugin → Gradle Plugin Portal. Gated on the signing/Central
+#                         secrets; a missing secret SKIPS the job (so a routine main push is a no-op).
+#
+# SAFETY: the Central step DEPLOYS to the Portal in a validated-but-unreleased state (vanniktech
+# `publishToMavenCentral`), so the human release-confirm in the Central UI is the final gate for the
+# first cut. Switch the task to `publishAndReleaseToMavenCentral` once the flow is trusted for full
+# automation. No secrets are configured yet → publish-central is inert until they are added:
+#   MAVEN_CENTRAL_USERNAME, MAVEN_CENTRAL_PASSWORD, SIGNING_IN_MEMORY_KEY, SIGNING_IN_MEMORY_KEY_PASSWORD,
+#   GRADLE_PUBLISH_KEY, GRADLE_PUBLISH_SECRET (Plugin Portal).
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 name: "Merged (Release)"
 on:
@@ -22,22 +27,278 @@ on:
       - main
     paths-ignore:
       - '*.md'
+  workflow_dispatch:
+    inputs:
+      increment:
+        description: "Version segment to bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 concurrency:
   group: merged-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: write # create tags + GitHub Releases
+
 jobs:
-  release:
-    name: "Label-driven release (STUB)"
+  # ── Derive the version + flags from the merged PR's labels (or the dispatch input) ──
+  plan:
+    name: "Plan release (labels → version)"
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      draft: ${{ steps.decide.outputs.draft }}
+      version: ${{ steps.version.outputs.version }}
+      has_central: ${{ steps.secrets.outputs.has_central }}
+      has_portal: ${{ steps.secrets.outputs.has_portal }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # Secrets aren't available in job/step `if:` contexts, so surface their PRESENCE (never a value)
+      # as job outputs the downstream `if:` can read.
+      - name: Detect release secrets
+        id: secrets
+        env:
+          CENTRAL_USER: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          SIGNING_KEY: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          PORTAL_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+        run: |
+          if [ -n "$CENTRAL_USER" ] && [ -n "$SIGNING_KEY" ]; then hc=true; else hc=false; fi
+          if [ -n "$PORTAL_KEY" ]; then hp=true; else hp=false; fi
+          echo "has_central=$hc" >> "$GITHUB_OUTPUT"
+          echo "has_portal=$hp"  >> "$GITHUB_OUTPUT"
+          echo "has_central=$hc has_portal=$hp"
+
+      - name: Resolve PR labels + flags
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            labels="${{ github.event.inputs.increment }}"
+          else
+            # Labels of the PR that produced this merge commit (squash-merge → one PR).
+            labels="$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+              --jq '.[0].labels[].name' 2>/dev/null | tr '\n' ' ' || true)"
+          fi
+          echo "labels: [$labels]"
+          has() { echo " $labels " | grep -q " $1 "; }
+          skip=false; draft=false; major=false; minor=false
+          has skip-release  && skip=true
+          has draft-release && draft=true
+          has major && major=true
+          has minor && minor=true
+          {
+            echo "skip=$skip"; echo "draft=$draft"
+            echo "major=$major"; echo "minor=$minor"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 21
+        if: steps.decide.outputs.skip != 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+      - name: Setup Gradle
+        if: steps.decide.outputs.skip != 'true'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Compute version + short-circuit if already released
+        id: version
+        if: steps.decide.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          FLAGS=""
+          [ "${{ steps.decide.outputs.major }}" = "true" ] && FLAGS="$FLAGS -PincrementMajor=true"
+          [ "${{ steps.decide.outputs.minor }}" = "true" ] && FLAGS="$FLAGS -PincrementMinor=true"
+          V="$(./gradlew :boringssl-jvm:printVersion -q $FLAGS | tail -1 | tr -d '[:space:]')"
+          echo "computed version: $V"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          # Short-circuit: a Release for this tag already exists → nothing to do (RFC §8 short-circuit).
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "::notice::Release v$V already exists — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Build + validate the tarballs / shared libs / AAR, stamped with the release version ──
+  build-linux:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    uses: ./.github/workflows/build-linux.yaml
+    with:
+      bundle_version: ${{ needs.plan.outputs.version }}
+
+  build-apple:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    uses: ./.github/workflows/build-apple.yaml
+    with:
+      bundle_version: ${{ needs.plan.outputs.version }}
+
+  build-android:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    uses: ./.github/workflows/build-android.yaml
+
+  # ── Heavy static tarballs → GitHub Releases (RFC §3 channel split) ──
+  github-release:
+    name: "GitHub Release (tarballs)"
+    needs: [plan, build-linux, build-apple, build-android]
+    if: needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: "STUB — label-driven version bump + build + validate + publish"
+
+      - name: Download all bundle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "boringssl-*"
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble SHA256SUMS + read canonical anchor
+        id: anchor
         run: |
-          echo "TODO step 3 (RFC §10): wire the release flow."
-          echo "  - version bump from PR labels (major/minor/patch; skip-release/draft-release)"
-          echo "  - build + validate-artifacts (binary-shaped)"
-          echo "  - publish small artifacts → Central (+ Plugin Portal); tarballs → GitHub Releases"
-          echo "  - tag + Release; notes state canonical commit + quiche ABI anchor"
-          echo "  - short-circuit if a Release for the canonical commit already exists"
+          set -euo pipefail
+          cd dist
+          # Keep only the K/N tarballs + their sidecars (the FFM .so/.dylib ride the MRJAR, not the Release).
+          ls -1 boringssl-*.tar.gz
+          sha256sum boringssl-*.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+          commit="$(grep -E '^boringssl = ' gradle/libs.versions.toml | grep -oE '[0-9a-f]{40}')"
+          quiche="$(grep -E '^boringsslQuicheAbi = ' gradle/libs.versions.toml | cut -d'"' -f2)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "quiche=$quiche" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release v${{ needs.plan.outputs.version }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.plan.outputs.version }}
+          DRAFT: ${{ needs.plan.outputs.draft }}
+          COMMIT: ${{ steps.anchor.outputs.commit }}
+          QUICHE: ${{ steps.anchor.outputs.quiche }}
+        run: |
+          set -euo pipefail
+          notes="$(cat <<EOF
+          Canonical BoringSSL commit: \`$COMMIT\`
+          ABI anchor: **$QUICHE**
+
+          Per-triple static bundles (\`headers + libcrypto.a + libssl.a\`) for Kotlin/Native cinterop,
+          resolved by the \`com.ditchoom.boringssl.provision\` plugin. Each tarball carries a \`.sha256\`;
+          \`SHA256SUMS\` lists them all and the checksums are baked into the published provision plugin.
+          The JVM FFM shared libraries ship in the \`boringssl-jvm\` MRJAR; the Android static \`.a\` ship
+          in the \`boringssl-android\` prefab AAR (both on Maven Central).
+          EOF
+          )"
+          args=(--title "v$V" --notes "$notes")
+          [ "$DRAFT" = "true" ] && args+=(--draft)
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release upload "v$V" dist/boringssl-*.tar.gz dist/boringssl-*.tar.gz.sha256 \
+              dist/boringssl-*.provenance.json dist/SHA256SUMS --clobber
+          else
+            gh release create "v$V" "${args[@]}" \
+              dist/boringssl-*.tar.gz dist/boringssl-*.tar.gz.sha256 \
+              dist/boringssl-*.provenance.json dist/SHA256SUMS
+          fi
+
+  # ── Small artifacts → Maven Central (+ Plugin Portal). Gated on the release secrets. ──
+  publish-central:
+    name: "Publish to Maven Central + Plugin Portal"
+    needs: [plan, build-linux, build-apple, build-android]
+    # draft-release builds but does NOT publish to Central; skip when the Central secrets are absent.
+    if: >-
+      needs.plan.outputs.skip != 'true' &&
+      needs.plan.outputs.draft != 'true' &&
+      needs.plan.outputs.has_central == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      NDK_VERSION: "28.2.13676358"
+      ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+      ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
+      ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+      ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+      - name: Setup Gradle (build cache)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Set up Android SDK + pinned NDK (for the prefab AAR)
+        uses: android-actions/setup-android@v3
+      - name: Install pinned NDK
+        run: |
+          sdkmanager --install "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Download all bundle artifacts (tarballs + FFM shared libs)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "boringssl-*"
+          merge-multiple: true
+          path: dist
+
+      - name: Restore built BoringSSL archives (source clone + android .a for the AAR)
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl-build/build/boringssl/src
+            boringssl-build/libs/boringssl/android
+          key: bssl-publish-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            bssl-android-
+
+      - name: Stage FFM shared libs into the MRJAR layout
+        run: |
+          set -euo pipefail
+          # linuxX64/linuxArm64 → .so ; macosX64/macosArm64 → .dylib. The build lanes uploaded these
+          # as libboringsslffi-<ver>-<triple>.{so,dylib}; the MRJAR expects them at libs/.../lib/.
+          shopt -s nullglob
+          for f in dist/libboringsslffi-*-*.so dist/libboringsslffi-*-*.dylib; do
+            base="$(basename "$f")"; ext="${base##*.}"
+            triple="$(echo "$base" | sed -E "s/^libboringsslffi-.*-([A-Za-z0-9]+)\.$ext$/\1/")"
+            mkdir -p "boringssl-build/libs/boringssl/$triple/lib"
+            cp "$f" "boringssl-build/libs/boringssl/$triple/lib/libboringsslffi.$ext"
+            echo "staged $triple/libboringsslffi.$ext"
+          done
+
+      - name: Publish small artifacts to Maven Central (deploy → manual release-confirm)
+        env:
+          V: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          # bakeChecksums bakes the released tarball digests into the provision plugin (no TOFU).
+          ./gradlew :boringssl-provision:bakeChecksums -Pversion="$V" -PchecksumsFile="$PWD/dist/SHA256SUMS" --stacktrace
+          # boringssl-jvm applies the multiplatform convention, so its publication carries the host's
+          # registered-target klibs (linux on this runner) alongside the JVM MRJAR — assemble builds
+          # them so the metadata publications resolve.
+          ./gradlew :boringssl-jvm:assemble -Pversion="$V" --stacktrace
+          # vanniktech `publishToMavenCentral` DEPLOYS to the Portal (validated, pending manual release).
+          ./gradlew \
+            :boringssl-bom:publishToMavenCentral \
+            :boringssl-jvm:publishToMavenCentral \
+            :boringssl-android:publishToMavenCentral \
+            :boringssl-provision:publishToMavenCentral \
+            -Pversion="$V" --no-configuration-cache --stacktrace
+
+      - name: Publish the provision plugin to the Gradle Plugin Portal
+        if: needs.plan.outputs.has_portal == 'true'
+        env:
+          V: ${{ needs.plan.outputs.version }}
+          GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
+          GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
+        run: |
+          ./gradlew :boringssl-provision:publishPlugins -Pversion="$V" \
+            -Pgradle.publish.key="$GRADLE_PUBLISH_KEY" -Pgradle.publish.secret="$GRADLE_PUBLISH_SECRET" \
+            --no-configuration-cache --stacktrace

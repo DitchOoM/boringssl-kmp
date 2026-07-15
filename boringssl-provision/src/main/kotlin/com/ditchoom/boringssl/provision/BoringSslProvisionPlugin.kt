@@ -29,8 +29,17 @@ class BoringSslProvisionPlugin : Plugin<Project> {
 }
 
 open class BoringSslProvisionExtension(private val project: Project) {
+    // Baked-in release identity + checksums, loaded from `boringssl-provision.properties` on the plugin
+    // classpath (written by :boringssl-provision:bakeChecksums at release time — RFC §8 directive #4).
+    // Absent in dev builds → version falls back to "0.0.1" and checksums stay empty (localDist path).
+    private val baked: java.util.Properties =
+        java.util.Properties().apply {
+            BoringSslProvisionExtension::class.java.getResourceAsStream("/boringssl-provision.properties")
+                ?.use { load(it) }
+        }
+
     /** The boringssl-kmp *release* version (bundle), NOT the BoringSSL commit. */
-    var version: String = "0.0.1"
+    var version: String = baked.getProperty("version")?.takeIf { it.isNotBlank() } ?: "0.0.1"
 
     /**
      * Base URL for released tarballs. Default is the GitHub Releases download root; a release tag `v$version`
@@ -49,11 +58,13 @@ open class BoringSslProvisionExtension(private val project: Project) {
     var cacheRoot: File = File(project.gradle.gradleUserHomeDir, "caches/ditchoom-boringssl")
 
     /**
-     * Baked-in `triple -> sha256` map for the released tarballs (no trust-on-first-use). Populated per
-     * release (step 3). For a [localDist] resolve the sibling `.sha256` is authoritative and this may
-     * stay empty; for a remote fetch a missing entry is a hard error.
+     * Baked-in `triple -> sha256` map for the released tarballs (no trust-on-first-use). Defaults to the
+     * checksums baked into the shipped plugin for [version]; a consumer may override or extend it. For a
+     * [localDist] resolve the sibling `.sha256` is authoritative and this may stay empty; for a remote
+     * fetch a missing entry is a hard error.
      */
-    var checksums: Map<String, String> = emptyMap()
+    var checksums: Map<String, String> =
+        baked.stringPropertyNames().filter { it != "version" }.associateWith { baked.getProperty(it) }
 
     /**
      * Returns `<cacheRoot>/<version>/<triple>` containing `{include, lib}`, materialising (download →

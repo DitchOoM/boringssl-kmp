@@ -63,6 +63,16 @@ if (version.toString() == "unspecified") {
     version = computeNextVersion(snapshot = !onGithub)
 }
 
+// The release workflow (merged.yaml) resolves the next version once from this derivation — honouring the
+// PR-label flags -PincrementMajor/-PincrementMinor — and passes it to every module as -Pversion=<ver>.
+// `-q` keeps stdout to just the version string.
+tasks.register("printVersion") {
+    group = "help"
+    description = "Print the derived project version (honours -PincrementMajor/-PincrementMinor)."
+    val v = version.toString()
+    doLast { println(v) }
+}
+
 // Structural identity, derived — never restated per module.
 val moduleArtifactId = name
 val androidNamespace = "com.ditchoom." + name.replace('-', '.')
