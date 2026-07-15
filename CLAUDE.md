@@ -73,13 +73,15 @@ boringssl-testsuite   per-target link-smoke validation (apiCheck-excluded)      
 
 ## Build logic — the convention plugin (no copy-paste)
 
-KMP-shaped modules (`-jvm`, `-android`, `-testsuite`) apply **one** convention plugin,
+KMP-shaped modules (`-jvm`, `-testsuite`) apply **one** convention plugin,
 `build-logic/src/main/kotlin/boringssl.multiplatform-library.gradle.kts`. It owns the K/N target
 matrix (RFC §7, 12 triples), the JDK-21 toolchain, Android (minSdk 24 per D7), jvm, ktlint, dokka,
 kover, binary-compatibility validation (JVM dump only), Maven Central publishing, signing, and version
 derivation. It is the webrtc convention **trimmed**: js/wasm, kotlinx-benchmark, allopen, and KSP are
-dropped. `:boringssl-build` (plain Gradle), `:boringssl-provision` (Gradle plugin), and
-`:boringssl-bom` (java-platform) deliberately do NOT apply it.
+dropped. `:boringssl-build` (plain Gradle), `:boringssl-provision` (Gradle plugin), `:boringssl-bom`
+(java-platform), and `:boringssl-android` (hand-rolled `maven-publish` prefab-AAR producer — a prefab
+AAR carries no Kotlin, and AGP's KMP-library DSL has no prefab-publishing surface) deliberately do NOT
+apply it.
 
 A module's own `build.gradle.kts` carries only its dependencies/specifics; per-module POM prose lives
 in `<module>/gradle.properties` (`POM_NAME`, `POM_DESCRIPTION`); shared POM/developer/license fields

@@ -9,8 +9,8 @@
 # per-arch (in CI: linuxX64 on ubuntu-24.04, linuxArm64 on ubuntu-24.04-arm — the legacy builder, no
 # qemu/buildx; locally arm64-on-x64 falls back to buildx+qemu), so neither needs a cross-glibc toolchain.
 #
-# The image is content-addressed (tag carries a hash of this Dockerfile + build-boringssl.sh) and
-# built once, so it is a stable cache entry across builds.
+# The image is content-addressed (tag carries a hash of this Dockerfile alone — the build scripts are
+# bind-mounted at /work, not baked in) and built once, so it is a stable cache entry across builds.
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 ARG BASE=quay.io/pypa/manylinux2014_x86_64
 FROM ${BASE}

@@ -17,7 +17,10 @@ plugins {
 // Not a published API surface → apiCheck-excluded.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-tasks.matching { it.name == "apiCheck" || it.name == "apiDump" }.configureEach {
+// Not a published API surface → exclude from binary-compatibility validation. Disable BOTH the
+// aggregate (apiCheck/apiDump) AND the per-target variants (jvmApiCheck/jvmApiDump…) — the aggregate
+// alone leaves jvmApiCheck demanding a non-existent api/jvm/*.api dump and failing the build.
+tasks.matching { it.name.endsWith("ApiCheck") || it.name.endsWith("ApiDump") }.configureEach {
     enabled = false
 }
 
@@ -25,7 +28,9 @@ tasks.matching { it.name == "apiCheck" || it.name == "apiDump" }.configureEach {
 val bsslBuild = project(":boringssl-build")
 val smokeTriple = "linuxX64"
 val provisioned = bsslBuild.projectDir.resolve("libs/boringssl/$smokeTriple")
-val buildArchiveTask = "${bsslBuild.path}:buildBoringSsl${smokeTriple.replaceFirstChar { it.uppercase() }}"
+// Depend on the ARCHIVE stage only — the K/N link-smoke statically links libssl.a/libcrypto.a and
+// never touches libboringsslffi.so, so there's no need to trigger the .so link for this smoke.
+val buildArchiveTask = "${bsslBuild.path}:buildBoringSslArchives${smokeTriple.replaceFirstChar { it.uppercase() }}"
 
 val baseDef = layout.projectDirectory.file("src/nativeInterop/cinterop/boringsslsmoke.def")
 val generatedDef = layout.buildDirectory.file("generated/cinterop/boringsslsmoke.def")
@@ -51,16 +56,27 @@ val generateSmokeDef =
         }
     }
 
-kotlin {
-    linuxX64 {
-        compilations.getByName("main").cinterops.create("boringsslsmoke") {
-            defFile(project.file("build/generated/cinterop/boringsslsmoke.def"))
-            includeDirs(provisioned.resolve("include"))
+// Skip the K/N native target on a linux-aarch64 host: Kotlin/Native has no linux-aarch64 HOST target,
+// so registering linuxX64 there throws at config time (same guard the convention plugin uses). The
+// linuxX64 cinterop link-smoke only runs on an x86_64 host anyway.
+val knHostSupported =
+    !(
+        System.getProperty("os.name").orEmpty().startsWith("Linux", ignoreCase = true) &&
+            System.getProperty("os.arch").orEmpty() in listOf("aarch64", "arm64")
+    )
+
+if (knHostSupported) {
+    kotlin {
+        linuxX64 {
+            compilations.getByName("main").cinterops.create("boringsslsmoke") {
+                defFile(project.file("build/generated/cinterop/boringsslsmoke.def"))
+                includeDirs(provisioned.resolve("include"))
+            }
         }
     }
-}
 
-// The cinterop must see the generated def (and thus the built archive) first.
-tasks.matching { it.name == "cinteropBoringsslsmokeLinuxX64" }.configureEach {
-    dependsOn(generateSmokeDef)
+    // The cinterop must see the generated def (and thus the built archive) first.
+    tasks.matching { it.name == "cinteropBoringsslsmokeLinuxX64" }.configureEach {
+        dependsOn(generateSmokeDef)
+    }
 }

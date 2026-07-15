@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
-# In-container BoringSSL build for one linux triple (RFC §8a). Runs inside the manylinux2014 image
-# (glibc 2.17) so the produced archives reference only Kotlin/Native-floor-safe libc symbols.
+# In-container BoringSSL STATIC-ARCHIVE build for one linux triple (RFC §8a). Runs inside the
+# manylinux2014 image (glibc 2.17) so the produced archives reference only Kotlin/Native-floor-safe
+# libc symbols.
 #
-# Invoked by :boringssl-build's build task as:
-#   docker run ... <image> /work/boringssl-build/docker/build-boringssl.sh <triple>
+# This is the EXPENSIVE half of the build (compiles all of BoringSSL) and depends ONLY on the pinned
+# commit + the toolchain — NOT on the FFI shim. The cheap shim→.so re-link lives in link-ffi.sh, so
+# growing the shim surface no longer recompiles BoringSSL (build.gradle.kts keys the two on separate
+# markers).
+#
+# Invoked by :boringssl-build's archive task as:
+#   docker run ... <image> /work/boringssl-build/docker/build-archives.sh <triple>
 # with CFLAGS + CC passed via env. The repo root is bind-mounted at /work.
 #
 # Args: $1 = konan triple id (linuxX64 | linuxArm64)
 # Env : CFLAGS (default -fPIC), CC (default cc)
+# Produces: $OUT/lib/{libssl.a,libcrypto.a}  +  $OUT/include/**   (NOT the .so — see link-ffi.sh)
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-TRIPLE="${1:?usage: build-boringssl.sh <triple>}"
+TRIPLE="${1:?usage: build-archives.sh <triple>}"
 CFLAGS="${CFLAGS:--fPIC}"
 CC="${CC:-cc}"
 
 SRC="/work/boringssl-build/build/boringssl/src"
 BUILD="/work/boringssl-build/build/boringssl/build-${TRIPLE}"
 OUT="/work/boringssl-build/libs/boringssl/${TRIPLE}"
-COMMIT_MARKER=$(basename "$(ls "$SRC"/.. 2>/dev/null)")  # informational only
 
 [ -f "$SRC/CMakeLists.txt" ] || { echo "BoringSSL source missing at $SRC (run fetchBoringSsl)"; exit 1; }
 
@@ -58,4 +64,5 @@ ar r "$OUT/lib/libcrypto.a" isoc23.o
 # Headers (BoringSSL: src/include/openssl/*.h; older layouts: include/).
 if [ -d "$SRC/src/include" ]; then cp -a "$SRC/src/include/." "$OUT/include/"; else cp -a "$SRC/include/." "$OUT/include/"; fi
 
-echo "built ($TRIPLE) on $(getconf GNU_LIBC_VERSION) → $OUT/lib"
+echo "built archives ($TRIPLE) on $(getconf GNU_LIBC_VERSION) → $OUT/lib"
+ls -l "$OUT/lib"/*.a

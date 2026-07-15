@@ -7,7 +7,7 @@
 #       - no committed binaries (*.a/*.so/*.dylib/tarballs)
 #       - exactly ONE `boringssl` 40-hex commit literal in the tree (the single-pin directive)
 #       - no `BORINGSSL_PREFIX` unless catalog-flagged (one-unprefixed-copy invariant)
-#     → build-linux  +  build-apple  +  build-android      (per-triple cmake, the RFC §7 matrix)
+#     → build-linux  +  build-android  (+ build-apple, DISABLED until step 7 — authored on macOS)
 #     → validate-artifacts  (binary-shaped, RFC §8: tarball extracts; required headers present;
 #         nm/llvm-nm shows required symbols UNPREFIXED and exactly one libcrypto; a throwaway
 #         wrapper-.def compile+link per K/N triple; FFM SymbolLookup resolves on JVM; AAR prefab
@@ -59,32 +59,66 @@ jobs:
     needs: [grep-gate]
     uses: ./.github/workflows/build-linux.yaml
 
-  build-apple:
-    name: "build-apple (STUB — step 7)"
-    needs: [grep-gate]
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v6
-      - name: "Apple triples placeholder"
-        run: |
-          echo "TODO step 7 — macos/ios triples; tvOS/watchOS behind the spike (RFC D4)."
+  # build-apple: DISABLED for now (RFC step 7). The Apple per-SDK cmake cross-compile is authored on a
+  # macOS machine (this CI can't build Apple targets), then this lane is re-enabled to run on macos-14.
+  # Nothing `needs` it, so leaving it off keeps the PR pipeline green on the Linux/Android/JVM lanes.
+  # build-apple:
+  #   needs: [grep-gate]
+  #   uses: ./.github/workflows/build-apple.yaml   # authored in step 7 on macOS
 
   build-android:
-    name: "build-android (STUB — step 7)"
     needs: [grep-gate]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - name: "Android prefab placeholder"
-        run: |
-          echo "TODO step 7 — NDK prefab AAR (arm64-v8a, x86_64 only; RFC §5 Rule D)."
+    # REAL: NDK cross-compile arm64-v8a + x86_64 static .a + whole-archive Bionic-24 link-smoke. The
+    # prefab AAR packaging (:boringssl-android) consumes these archives in a follow-up step.
+    uses: ./.github/workflows/build-android.yaml
 
+  # Binary-shaped validation of the built Linux bundles (RFC §8). Runs per-triple on the NATIVE-arch
+  # runner (mirrors build-linux) so the FFM SymbolLookup smoke exercises each .so on its own arch —
+  # you can't run a linuxArm64 .so on an x64 JVM. The static guards (checksums, headers, nm single-
+  # copy) are arch-independent but run here too, close to the artifact. Depends ONLY on build-linux;
+  # the apple/android lanes are stubs and validate-artifacts grows their checks in step 7.
   validate-artifacts:
-    name: "validate-artifacts (STUB — step 3)"
-    needs: [build-linux, build-apple, build-android]
-    runs-on: ubuntu-24.04
+    name: "validate-artifacts (${{ matrix.triple }})"
+    needs: [build-linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - triple: linuxX64
+            runner: ubuntu-24.04
+          - triple: linuxArm64
+            runner: ubuntu-24.04-arm # native ARM64 — runs the arm64 .so under an arm64 JVM
     steps:
       - uses: actions/checkout@v6
-      - name: "Binary-shaped validation placeholder"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: Setup Gradle (build cache)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Download ${{ matrix.triple }} bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-${{ matrix.triple }}
+          path: dist
+
+      # ── Static binary guards: checksums, extract, headers, nm single-copy / un-mangled (D3) ──
+      #    Each triple validates on its own native-arch runner, so the stock `nm` reads its archives.
+      - name: "Binary-shaped guards (${{ matrix.triple }})"
+        run: bash boringssl-build/scripts/validate-artifacts.sh "${{ matrix.triple }}" dist
+
+      # ── FFM SymbolLookup RUNTIME smoke: stage the downloaded .so and run the real link-smoke test.
+      #    This is the RFC §8 "FFM SymbolLookup resolves on JVM" check, against the RELEASED .so on the
+      #    native arch (jvm21Test loads META-INF/native/<os>-<arch>/libboringsslffi.so via System.load).
+      - name: "FFM SymbolLookup link-smoke (${{ matrix.triple }})"
         run: |
-          echo "TODO step 3 — nm single-copy guard, wrapper-.def link, FFM SymbolLookup, quiche link-smoke, per-ABI size."
+          mkdir -p "boringssl-build/libs/boringssl/${{ matrix.triple }}/lib"
+          cp dist/libboringsslffi-*-${{ matrix.triple }}.so \
+             "boringssl-build/libs/boringssl/${{ matrix.triple }}/lib/libboringsslffi.so"
+          ./gradlew :boringssl-jvm:jvm21Test --rerun-tasks --stacktrace
