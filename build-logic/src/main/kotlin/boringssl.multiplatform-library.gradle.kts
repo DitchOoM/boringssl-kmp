@@ -126,7 +126,13 @@ kotlin {
     // exactly as buffer-crypto omits it; Windows/mingw is a non-target (D6). tvOS/watchOS BoringSSL
     // cross-compile is unproven and gated behind a spike (D4) — registering the target here is
     // compile-faithful only until step 7 proves the cmake path.
-    if (knHostSupported) {
+    // A module with NO common/native source (e.g. :boringssl-jvm, a JVM-only FFM MRJAR producer) opts
+    // OUT of K/N target registration via `boringsslNativeTargets=false` — otherwise its publication
+    // carries empty, unbuildable native klib variants (the compilations are NO-SOURCE, so no .klib is
+    // produced and publishing fails). K/N consumers get BoringSSL via the provision plugin, never via a
+    // JVM module, so dropping the vestigial targets is correct. Defaults to true (testsuite needs them).
+    val registerNativeTargets = (findProperty("boringsslNativeTargets") as String?)?.toBooleanStrictOrNull() ?: true
+    if (knHostSupported && registerNativeTargets) {
         if (isMacHost) {
             macosX64()
             macosArm64()

@@ -189,10 +189,9 @@ jobs:
           V: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          # Bake the released tarball digests into the provision plugin (no TOFU), then build the jvm
-          # native klibs (the multiplatform convention publishes them alongside the MRJAR).
+          # Bake the released tarball digests into the provision plugin (no TOFU). boringssl-jvm is
+          # JVM-only (boringsslNativeTargets=false) so publishToMavenLocal needs no native-klib prebuild.
           ./gradlew :boringssl-provision:bakeChecksums -Pversion="$V" -PchecksumsFile="$PWD/dist/SHA256SUMS" --stacktrace
-          ./gradlew :boringssl-jvm:assemble -Pversion="$V" --stacktrace
           ./gradlew \
             :boringssl-bom:publishToMavenLocal \
             :boringssl-jvm:publishToMavenLocal \
