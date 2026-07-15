@@ -24,10 +24,12 @@ The **Android** static-archive path is implemented too: `buildBoringSslAndroid` 
 `arm64-v8a` + `x86_64` (only — armeabi-v7a dropped per §5 Rule D / D7) with the **NDK** toolchain
 against `ANDROID_PLATFORM=android-24` (matches the convention plugin's `minSdk`), and
 `checkBoringSslAndroid` runs an NDK **whole-archive link-smoke** against Bionic-24 (the Android analog
-of `checkGlibcFloor`) plus the D3 plain-`SHA256_Init` check. No manylinux container, no `__isoc23`
-shim, no `.so` — Android consumers use JNI + a prefab AAR of the static `.a`. Packaging those archives
-into `:boringssl-android`'s prefab AAR (+ the §5 ≤2.5 MB/ABI budget on the linked subset) is the next
-step.
+of `checkGlibcFloor`), the D3 plain-`SHA256_Init` check, **and** the §5 ≤2.5 MiB/ABI budget gate
+(`checkAndroidSize<Abi>` — a `--gc-sections`+strip link of a representative DTLS+crypto surface; ~1.1
+MB/ABI at the pin). No manylinux container, no `__isoc23` shim, no `.so` — Android consumers use JNI +
+a prefab AAR of the static `.a`. **`:boringssl-android` packages these archives into the prefab AAR**
+(`crypto`/`ssl` prefab modules, per-ABI `abi.json`) and publishes it; it depends on
+`checkBoringSslAndroid` so an over-budget or non-linking archive can never be shipped.
 
 Apple (per-SDK cmake incl. the arm64 iOS-simulator asm-SDK-tag fix) arrives later; tvOS/watchOS after
 the step-7 spike proves the cross-compile.

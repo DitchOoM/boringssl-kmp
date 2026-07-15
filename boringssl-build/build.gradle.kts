@@ -573,6 +573,42 @@ val androidAbis =
         // armeabi-v7a (32-bit ARM) deliberately dropped — RFC §5 Rule D / D7.
     )
 
+// ── §5 per-ABI size budget ───────────────────────────────────────────────────────────────────────
+// The budget is on "the static subset the consumer PULLS" (post --gc-sections), NOT the raw ~4 MB
+// archive. checkAndroidSize links a representative DTLS+crypto surface — what webrtc-dtls (DTLS) and
+// quiche (TLS+AEAD+HKDF) actually reference — with --gc-sections, strips, and gates the result. At the
+// canonical pin this lands ~1.1 MB/ABI, comfortably under 2.5 MiB.
+val androidAbiBudgetBytes = 2_621_440L // 2.5 MiB (RFC §5)
+val androidBudgetProbe =
+    """
+    #include <openssl/ssl.h>
+    #include <openssl/sha.h>
+    #include <openssl/hmac.h>
+    #include <openssl/hkdf.h>
+    #include <openssl/curve25519.h>
+    #include <openssl/aead.h>
+    #include <openssl/rand.h>
+    #include <openssl/ec.h>
+    #include <openssl/evp.h>
+    #include <openssl/x509.h>
+    /* A broad, realistic DTLS/QUIC-ish surface so --gc-sections keeps a representative consumer
+       footprint (webrtc-dtls uses DTLS; quiche uses TLS+AEAD+HKDF+crypto). */
+    void boringssl_budget_probe(void) {
+        SSL_CTX *c = SSL_CTX_new(DTLS_method()); SSL *s = SSL_new(c);
+        SSL_do_handshake(s); SSL_read(s, 0, 0); SSL_write(s, 0, 0); SSL_shutdown(s);
+        SSL_CTX_new(TLS_method());
+        unsigned char h[64]; SHA256(0, 0, h); SHA512(0, 0, h);
+        unsigned int hl; HMAC(EVP_sha256(), 0, 0, 0, 0, h, &hl);
+        HKDF(h, 0, EVP_sha256(), 0, 0, 0, 0, 0, 0);
+        uint8_t pub[32], priv[32]; X25519_keypair(pub, priv); X25519(h, priv, pub);
+        EVP_AEAD_CTX_new(EVP_aead_chacha20_poly1305(), h, 32, 0);
+        (void)EVP_aead_aes_128_gcm();
+        RAND_bytes(h, 32);
+        (void)EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+        X509 *x = X509_new(); X509_verify(x, 0);
+    }
+    """.trimIndent() + "\n"
+
 // Resolve the NDK: ANDROID_NDK_HOME/ROOT, else the highest-versioned ndk/<ver> under the SDK. Returns
 // (ndkDir, version) — version is the directory name (e.g. 28.2.13676358), folded into the build marker
 // + provenance so an NDK bump rebuilds. Null when no NDK is installed (tasks fail with a clear message).
@@ -597,7 +633,7 @@ fun ndkPrebuilt(ndkDir: File): File =
     ndkDir.resolve("toolchains/llvm/prebuilt").listFiles { f -> f.isDirectory }?.firstOrNull()
         ?: throw GradleException("NDK prebuilt toolchain dir not found under $ndkDir")
 
-fun registerAndroidAbi(a: AndroidAbi): Pair<TaskProvider<Task>, TaskProvider<Task>> {
+fun registerAndroidAbi(a: AndroidAbi): Pair<TaskProvider<Task>, List<TaskProvider<Task>>> {
     val outDir = projectDir.resolve("libs/boringssl/android/${a.abi}")
     val libDir = outDir.resolve("lib")
 
@@ -718,7 +754,43 @@ fun registerAndroidAbi(a: AndroidAbi): Pair<TaskProvider<Task>, TaskProvider<Tas
                 logger.lifecycle("android ${a.abi} link-smoke OK: whole-archive links against Bionic-$boringsslAndroidApi (${smokeSo.length() / 1024} KiB) + plain SHA256_Init present.")
             }
         }
-    return build to smoke
+
+    // §5 budget gate: link the representative DTLS+crypto probe with --gc-sections, strip, and fail if
+    // the linked subset exceeds androidAbiBudgetBytes. Models the footprint a real consumer pulls.
+    val budgetSo = boringsslWork.get().dir("budget-android-${a.abi}").file("libbudget.so").asFile
+    val size =
+        tasks.register("checkAndroidSize${a.suffix}") {
+            group = "boringssl"
+            description = "Fail if Android ${a.abi}'s representative linked subset exceeds the §5 ${androidAbiBudgetBytes / 1024} KiB budget."
+            dependsOn(build)
+            inputs.files(libDir.resolve("libssl.a"), libDir.resolve("libcrypto.a"))
+            outputs.file(budgetSo)
+            doLast {
+                val (ndkDir, _) = resolveNdk() ?: throw GradleException("Android size check needs an NDK (see buildBoringSslAndroid${a.suffix}).")
+                val bin = ndkPrebuilt(ndkDir).resolve("bin")
+                val work = budgetSo.parentFile.apply { mkdirs() }
+                val probe = work.resolve("probe.c").apply { writeText(androidBudgetProbe) }
+                runOrThrow(
+                    bin.resolve("clang").absolutePath, "--target=${a.clangTriple}$boringsslAndroidApi",
+                    "-fPIC", "-O2", "-ffunction-sections", "-fdata-sections",
+                    "-I", outDir.resolve("include").absolutePath, "-shared", "-o", budgetSo.absolutePath,
+                    probe.absolutePath, libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
+                    "-Wl,--gc-sections", "-Wl,--no-undefined",
+                    dir = work, what = "android budget link ${a.abi}",
+                )
+                runOrThrow(bin.resolve("llvm-strip").absolutePath, "--strip-unneeded", budgetSo.absolutePath,
+                    dir = work, what = "android budget strip ${a.abi}")
+                val bytes = budgetSo.length()
+                logger.lifecycle("android ${a.abi} representative linked subset: $bytes bytes (${bytes / 1024} KiB) / budget ${androidAbiBudgetBytes / 1024} KiB.")
+                if (bytes > androidAbiBudgetBytes) {
+                    throw GradleException(
+                        "android ${a.abi} exceeds the §5 size budget: ${bytes / 1024} KiB > ${androidAbiBudgetBytes / 1024} KiB " +
+                            "(representative DTLS+crypto subset, --gc-sections + strip).",
+                    )
+                }
+            }
+        }
+    return build to listOf(smoke, size)
 }
 
 val androidBuilds = androidAbis.associate { it.abi to registerAndroidAbi(it) }
@@ -731,8 +803,8 @@ tasks.register("buildBoringSslAndroid") {
 
 tasks.register("checkBoringSslAndroid") {
     group = "boringssl"
-    description = "NDK link-smoke every wired Android ABI (whole-archive link + D3 plain-symbol check)."
-    dependsOn(androidBuilds.values.map { it.second })
+    description = "NDK link-smoke + §5 size-budget gate for every wired Android ABI."
+    dependsOn(androidBuilds.values.flatMap { it.second })
 }
 
 // `assemble` produces the distributable tarballs.

@@ -17,7 +17,10 @@ plugins {
 // Not a published API surface → apiCheck-excluded.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-tasks.matching { it.name == "apiCheck" || it.name == "apiDump" }.configureEach {
+// Not a published API surface → exclude from binary-compatibility validation. Disable BOTH the
+// aggregate (apiCheck/apiDump) AND the per-target variants (jvmApiCheck/jvmApiDump…) — the aggregate
+// alone leaves jvmApiCheck demanding a non-existent api/jvm/*.api dump and failing the build.
+tasks.matching { it.name.endsWith("ApiCheck") || it.name.endsWith("ApiDump") }.configureEach {
     enabled = false
 }
 
