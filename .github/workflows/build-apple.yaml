@@ -1,0 +1,154 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# Build & package the canonical Apple BoringSSL bundles (RFC §7 / §8 / D2 / D4).
+#
+# Apple can ONLY be built on macOS (Xcode's clang + per-SDK sysroots) — so this whole lane runs on
+# GitHub's macOS runners. Each of the 12-triple matrix's 10 Apple triples cross-compiles natively with
+# CMAKE_OSX_SYSROOT/_ARCHITECTURES/_DEPLOYMENT_TARGET (+ CMAKE_SYSTEM_NAME for iOS/tvOS/watchOS). There
+# is NO glibc floor and NO container: on Apple the DEPLOYMENT TARGET is the portability floor.
+#
+# RUNTIME vs COMPILE-FAITHFUL (directive #6):
+#   • macosArm64  — RUNTIME: FFM jvm21Test (10 KATs) on the arm64 runner + K/N cinterop link-smoke.
+#   • macosX64    — COMPILE-FAITHFUL: cross-compiled on the arm64 runner (build + per-SDK link-smoke +
+#                   validate-apple.sh). Executing the x86_64 dylib on-arch needs an Intel host; GitHub's
+#                   macos-13 runners are deprecated + starved, so CI is not gated on them (macos-x86_64
+#                   runtime is a follow-up via Rosetta or a self-hosted Intel runner).
+#   • iOS device + all simulators — COMPILE-FAITHFUL: cross-compiled + per-SDK link-smoke (a throwaway
+#                   probe .dylib links against the archive; Mach-O errors on any undefined/above-floor
+#                   symbol). Simulator/device runtime execution is a possible future upgrade.
+#   • tvOS / watchOS — COMPILE-FAITHFUL (D4 spike): authored + cross-compiled + link-smoked here; marked
+#                   proven=false in provenance until a consumer needs on-device runtime validation.
+#
+# STABLE CACHING — the built archives are content-addressed on the PINNED inputs (BoringSSL commit +
+# the Apple build recipe): a hit turns the ~from-source build into a no-op (the build task marker's
+# `onlyIf` short-circuits). BoringSSL source clone is keyed on the commit; ~/.konan on the catalog.
+# macOS runner concurrency is limited on public repos, so triples QUEUE — they do not fail (RFC §8).
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+name: "Build & Package (Apple)"
+
+on:
+  workflow_call: {}
+  workflow_dispatch: {}
+
+concurrency:
+  group: build-apple-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: "BoringSSL ${{ matrix.triple }} (${{ matrix.runner }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── macOS — macosArm64 is fully runtime-validated (the only lane that RUNS the dylib) ──
+          - { triple: macosArm64, cap: MacosArm64, runner: macos-14, ffi: true, kn: true }
+          # macosX64 is COMPILE-FAITHFUL: cross-compiled on the arm64 runner (build + per-SDK link-smoke
+          # + validate-apple.sh — nm reads the x86_64 Mach-O cross-arch). Executing the x86_64 dylib
+          # on-arch needs an Intel host; GitHub's macos-13 runners are deprecated + chronically starved,
+          # so we do NOT gate CI on them. macos-x86_64 runtime execution is a follow-up (Rosetta or a
+          # self-hosted Intel runner) — the shipped dylib is still built, symbol-hiding-checked, uploaded.
+          - { triple: macosX64, cap: MacosX64, runner: macos-14, ffi: false, kn: false }
+          # ── iOS device + simulators — compile-faithful (build + per-SDK link-smoke) ──
+          - { triple: iosArm64, cap: IosArm64, runner: macos-14, ffi: false, kn: false }
+          - { triple: iosSimulatorArm64, cap: IosSimulatorArm64, runner: macos-14, ffi: false, kn: false }
+          - { triple: iosX64, cap: IosX64, runner: macos-14, ffi: false, kn: false }
+          # ── tvOS + watchOS — D4 spike: compile-faithful (build + per-SDK link-smoke) ──
+          - { triple: tvosArm64, cap: TvosArm64, runner: macos-14, ffi: false, kn: false }
+          - { triple: tvosSimulatorArm64, cap: TvosSimulatorArm64, runner: macos-14, ffi: false, kn: false }
+          - { triple: tvosX64, cap: TvosX64, runner: macos-14, ffi: false, kn: false }
+          - { triple: watchosSimulatorArm64, cap: WatchosSimulatorArm64, runner: macos-14, ffi: false, kn: false }
+          - { triple: watchosX64, cap: WatchosX64, runner: macos-14, ffi: false, kn: false }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: Setup Gradle (build cache)
+        uses: gradle/actions/setup-gradle@v6
+
+      # ── Stable caches, keyed on the PINNED commit (+ the Apple recipe for the built archives) ──
+      - name: Cache Kotlin/Native (host toolchain + prebuilts)
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ matrix.runner }}-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ matrix.runner }}-
+
+      - name: Cache BoringSSL source clone
+        uses: actions/cache@v4
+        with:
+          path: boringssl-build/build/boringssl/src
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+
+      # THE big one: restore this triple's built archives + dylib; a hit turns the build into a no-op.
+      # Keyed on the commit + the Apple build/shim recipe (build.gradle.kts + the FFM shim surface).
+      - name: Cache built BoringSSL archives (${{ matrix.triple }})
+        uses: actions/cache@v4
+        with:
+          path: boringssl-build/libs/boringssl/${{ matrix.triple }}
+          key: bssl-apple-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/build.gradle.kts', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c') }}
+
+      # Build + per-SDK link-smoke + package (the pkg task dependsOn build + linkFfi + smoke).
+      - name: Build + link-smoke + package (${{ matrix.triple }})
+        run: ./gradlew :boringssl-build:packageBoringSslApple${{ matrix.cap }} --stacktrace
+
+      # Binary-shaped guards: checksums, extract, headers, exactly-one-libcrypto, un-mangled statics,
+      # and (macOS) the dylib single-copy symbol-hiding check.
+      - name: "Binary-shaped guards (${{ matrix.triple }})"
+        run: bash boringssl-build/scripts/validate-apple.sh "${{ matrix.triple }}" boringssl-build/build/dist
+
+      # ── FFM RUNTIME KAT (macOS): EXECUTE the shipped dylib on-arch — the same 10 vectors Linux runs.
+      #    The dylib was just built into libs/boringssl/<triple>/lib, so jvm21Test's stageNativeLibs
+      #    bundles it directly (no artifact round-trip needed within the same job).
+      - name: "FFM runtime KAT (${{ matrix.triple }})"
+        if: ${{ matrix.ffi }}
+        run: ./gradlew :boringssl-jvm:jvm21Test --rerun-tasks --stacktrace
+
+      # ── K/N cinterop link-smoke (macosArm64): statically link the archive into a K/N test binary and
+      #    run SHA256 — the Apple analog of the linuxX64 cinterop smoke (runs on the arm64 runner).
+      - name: "K/N cinterop link-smoke (${{ matrix.triple }})"
+        if: ${{ matrix.kn }}
+        run: ./gradlew :boringssl-testsuite:macosArm64Test --stacktrace
+
+      - name: Upload ${{ matrix.triple }} bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-${{ matrix.triple }}
+          # The K/N tarball (+ checksum + provenance) AND, for macOS, the FFM dylib (+ checksum). The
+          # dylib ships in the boringssl-jvm MRJAR, not the K/N bundle, but rides in the same upload.
+          path: |
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz.sha256
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.provenance.json
+            boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.dylib
+            boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.dylib.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # Combine per-triple checksums into one SHA256SUMS (the per-triple jobs each see only their own).
+  checksums:
+    name: "Aggregate SHA256SUMS (Apple)"
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "boringssl-*" # only Apple triples are produced in this workflow run
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        run: |
+          cd dist
+          sha256sum boringssl-*.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-apple-SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
