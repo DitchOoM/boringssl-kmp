@@ -1,3 +1,4 @@
+import com.vanniktech.maven.publish.JavaPlatform
 import org.gradle.api.artifacts.VersionCatalogsExtension
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -5,15 +6,19 @@ import org.gradle.api.artifacts.VersionCatalogsExtension
 // records the canonical BoringSSL commit + its quiche ABI anchor, so a consumer imports one platform
 // and gets a coherent set (RFC §7: webrtc-dtls W4 pins the whole matrix via this BOM).
 //
-// Published to Maven Central. `java-platform` is a core Gradle plugin — no external resolution.
+// Published to Maven Central via vanniktech (the same Central-Portal path as every other module).
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 plugins {
     `java-platform`
-    `maven-publish`
+    alias(libs.plugins.maven.publish)
+    signing
 }
 
 group = "com.ditchoom.boringssl"
+// The release version is passed by merged.yaml (`-Pversion=<ver>`); local/dev builds fall back to a
+// SNAPSHOT. -Pversion sets project.version directly, so this only supplies the dev fallback.
+version = (findProperty("version") as? String)?.takeIf { it.isNotBlank() && it != "unspecified" } ?: "0.0.1-SNAPSHOT"
 
 // Canonical anchor — read from the catalog (the ONE place the 40-hex literal lives, RFC §8). Recorded
 // here so the BOM POM documents the exact BoringSSL tree + quiche ABI it pins against.
@@ -24,26 +29,59 @@ val quicheAbi: String = libs.findVersion("boringsslQuicheAbi").get().requiredVer
 
 dependencies {
     constraints {
-        // Coordinates the BOM pins. Versions resolve at publish time from the shared version
-        // derivation (step 3); listed here so the platform's constraint set is explicit.
-        // api("com.ditchoom.boringssl:boringssl-provision:${project.version}")
-        // api("com.ditchoom.boringssl:boringssl-jvm:${project.version}")
-        // api("com.ditchoom.boringssl:boringssl-android:${project.version}")
+        // The coordinates the BOM pins — all at this release's version (from -Pversion). The BOM never
+        // pins itself. webrtc-dtls W4 imports this platform to lock the whole matrix (RFC §7).
+        api("com.ditchoom.boringssl:boringssl-provision:${project.version}")
+        api("com.ditchoom.boringssl:boringssl-jvm:${project.version}")
+        api("com.ditchoom.boringssl:boringssl-android:${project.version}")
     }
 }
 
-publishing {
-    publications {
-        create<MavenPublication>("bom") {
-            from(components["javaPlatform"])
-            pom {
-                name.set("BoringSSL BOM")
-                // Canonical anchor recorded in the POM (RFC §8: release notes state commit + quiche anchor).
-                description.set(
-                    "Bill-of-materials pinning all com.ditchoom.boringssl coordinates. " +
-                        "Canonical BoringSSL commit $canonicalCommit (ABI anchor: $quicheAbi).",
-                )
+val signingKey = findProperty("signingInMemoryKey")
+val signingPassword = findProperty("signingInMemoryKeyPassword")
+val isMainBranchGithub = System.getenv("GITHUB_REF") == "refs/heads/main"
+val shouldSignAndPublish = isMainBranchGithub && signingKey is String && signingPassword is String
+
+if (shouldSignAndPublish) {
+    signing {
+        useInMemoryPgpKeys(signingKey as String, signingPassword as String)
+    }
+}
+tasks.withType<Sign>().configureEach { onlyIf { shouldSignAndPublish } }
+
+mavenPublishing {
+    configure(JavaPlatform())
+    if (shouldSignAndPublish) {
+        publishToMavenCentral()
+        signAllPublications()
+    }
+    coordinates("com.ditchoom.boringssl", "boringssl-bom", version.toString())
+    pom {
+        name.set("BoringSSL BOM")
+        // Canonical anchor recorded in the POM (RFC §8: release notes state commit + quiche anchor).
+        description.set(
+            "Bill-of-materials pinning all com.ditchoom.boringssl coordinates. " +
+                "Canonical BoringSSL commit $canonicalCommit (ABI anchor: $quicheAbi).",
+        )
+        url.set(providers.gradleProperty("siteUrl"))
+        licenses {
+            license {
+                name.set(providers.gradleProperty("licenseName"))
+                url.set(providers.gradleProperty("licenseUrl"))
             }
+        }
+        developers {
+            developer {
+                id.set(providers.gradleProperty("developerId"))
+                name.set(providers.gradleProperty("developerName"))
+                email.set(providers.gradleProperty("developerEmail"))
+            }
+        }
+        organization { name.set(providers.gradleProperty("developerOrg")) }
+        scm {
+            connection.set(providers.gradleProperty("gitUrl"))
+            developerConnection.set(providers.gradleProperty("gitUrl"))
+            url.set(providers.gradleProperty("siteUrl"))
         }
     }
 }

@@ -17,6 +17,7 @@ import java.util.zip.ZipOutputStream
 
 plugins {
     `maven-publish`
+    alias(libs.plugins.maven.publish)
     signing
 }
 
@@ -163,14 +164,27 @@ publishing {
     }
 }
 
-// Sign on the main branch of CI with the key present (mirrors the convention's guard); local + PR
-// builds publish unsigned to mavenLocal.
+// ── Central-Portal transport (vanniktech) over the hand-rolled AAR publication ──
+// The `prefabAar` publication above is complete (artifact + full POM); vanniktech supplies only the
+// Central-Portal upload + signing, the same path as every other module. Signed Central publish on
+// main-branch CI with the key present; local + PR builds publish unsigned to mavenLocal (same gate).
 val signingKey = findProperty("signingInMemoryKey")
 val signingPassword = findProperty("signingInMemoryKeyPassword")
 val isMainBranchGithub = System.getenv("GITHUB_REF") == "refs/heads/main"
-if (isMainBranchGithub && signingKey is String && signingPassword is String) {
+val shouldSignAndPublish = isMainBranchGithub && signingKey is String && signingPassword is String
+
+if (shouldSignAndPublish) {
     signing {
-        useInMemoryPgpKeys(signingKey, signingPassword)
-        sign(extensions.getByType(PublishingExtension::class.java).publications["prefabAar"])
+        useInMemoryPgpKeys(signingKey as String, signingPassword as String)
+    }
+}
+tasks.withType<Sign>().configureEach { onlyIf { shouldSignAndPublish } }
+
+mavenPublishing {
+    // No configure()/coordinates() — the `prefabAar` publication is hand-rolled above; vanniktech just
+    // bundles + uploads (and signs) the existing publications to the Central Portal.
+    if (shouldSignAndPublish) {
+        publishToMavenCentral()
+        signAllPublications()
     }
 }

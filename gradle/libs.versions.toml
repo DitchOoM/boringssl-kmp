@@ -9,6 +9,7 @@ ktlint = "14.2.0"
 # bytecode), so it is the multiplatform-coverage tool here.
 detekt = "2.0.0-alpha.5"
 mavenPublish = "0.37.0"
+pluginPublish = "1.3.1"
 dokka = "2.2.0"
 kover = "0.9.8"
 binaryCompatibilityValidator = "0.18.1"
@@ -37,3 +38,4 @@ maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPubli
 dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }
 kover = { id = "org.jetbrains.kotlinx.kover", version.ref = "kover" }
 binary-compatibility-validator = { id = "org.jetbrains.kotlinx.binary-compatibility-validator", version.ref = "binaryCompatibilityValidator" }
+plugin-publish = { id = "com.gradle.plugin-publish", version.ref = "pluginPublish" }
