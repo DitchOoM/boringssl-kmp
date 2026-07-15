@@ -182,3 +182,28 @@ val jvm21TestTask =
     }
 
 tasks.named("check") { dependsOn(jvm21TestTask) }
+
+// ── JVM-only publication: suppress the vestigial Android variant ──────────────────────────────────
+// boringssl-jvm is a pure JVM/FFM library (no Android/native source). The convention applies the AGP
+// KMP-library plugin, which MANDATES an Android target — so without this it would publish an EMPTY,
+// misleading `boringssl-jvm-android` AAR (the real Android artifact is :boringssl-android's prefab AAR).
+// AGP won't let the target be dropped, so instead: (1) disable the android publication, and (2) strip
+// the now-dangling android variants from the root Gradle module metadata — leaving a clean jvm +
+// metadata module. JVM consumers are unaffected; there is simply no Android variant to (mis)resolve.
+tasks.matching { it.name.startsWith("publishAndroidPublication") }.configureEach { enabled = false }
+
+tasks.withType<org.gradle.api.publish.tasks.GenerateModuleMetadata>().configureEach {
+    doLast {
+        val moduleFile = outputFile.get().asFile
+        if (!moduleFile.exists()) return@doLast
+        @Suppress("UNCHECKED_CAST")
+        val root = groovy.json.JsonSlurper().parse(moduleFile) as MutableMap<String, Any?>
+        val variants = root["variants"] as? List<Map<String, Any?>> ?: return@doLast
+        val kept = variants.filterNot { (it["name"] as? String).orEmpty().contains("android", ignoreCase = true) }
+        if (kept.size != variants.size) {
+            root["variants"] = kept
+            moduleFile.writeText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(root)))
+            logger.lifecycle("Stripped ${variants.size - kept.size} android variant(s) from ${moduleFile.name} (JVM-only module).")
+        }
+    }
+}
