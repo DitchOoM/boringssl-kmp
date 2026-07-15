@@ -1,0 +1,79 @@
+package = com.ditchoom.boringssl
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# boringssl.def — the CANONICAL default cinterop surface shipped by the provision plugin (RFC §4).
+#
+# `boringssl.cinterop(target)` copies this def, injects the resolved `libraryPaths` / `staticLibraries`
+# (the absolute path to the provisioned libssl.a + libcrypto.a) and the platform `linkerOpts`, and
+# wires it onto the target's main compilation. A consumer therefore gets K/N BoringSSL bindings with
+# ~1 line and NO hand-written .def — the whole point of item 1.
+#
+# Two layers of surface:
+#   • `headers` binds BoringSSL's REAL declared functions/structs directly (SSL_CTX_*, EVP_AEAD_*, …)
+#     for advanced consumers.
+#   • the `---` inline block re-exposes the macro/`static inline` heavy primitives (digests, HMAC,
+#     HKDF, X25519, RNG) as concrete `boringssl_ffi_*` symbols — the SAME curated surface the FFM
+#     shared lib exports (boringssl_shim.h), so the cinterop and FFM worlds are callable identically.
+#
+# Override with `boringssl.cinterop(target, def = file("my.def"))` when a consumer needs a different
+# header/symbol set; the injection (libraryPaths/staticLibraries/linkerOpts) still applies.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+headers = openssl/base.h openssl/crypto.h openssl/sha.h openssl/hmac.h openssl/hkdf.h openssl/curve25519.h openssl/digest.h openssl/aead.h openssl/evp.h openssl/rand.h openssl/ec.h openssl/ssl.h
+compilerOpts = -DBORINGSSL_NO_CXX
+
+# libraryPaths + staticLibraries (absolute path to the provisioned archive) and the platform linkerOpts
+# are INJECTED by boringssl.cinterop(target) before this separator — do not add them here.
+
+---
+
+#include <openssl/crypto.h>
+#include <openssl/curve25519.h>
+#include <openssl/digest.h>
+#include <openssl/hkdf.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* The curated `boringssl_ffi_*` surface, as `static inline` wrappers so cinterop always materializes a
+ * concrete, callable symbol (bare macros / header decls do not always bind). Mirrors boringssl_shim.h
+ * one-for-one — the single source of truth for the exported surface (RFC §4). */
+
+/* OPENSSL_VERSION_NUMBER is a macro in BoringSSL — re-exposed as a real function (also a liveness probe). */
+static inline unsigned long boringssl_ffi_version_number(void) {
+    return (unsigned long) OPENSSL_VERSION_NUMBER;
+}
+
+static inline void boringssl_ffi_sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+    SHA256(data, len, out);
+}
+
+static inline void boringssl_ffi_sha512(const uint8_t *data, size_t len, uint8_t out[64]) {
+    SHA512(data, len, out);
+}
+
+static inline void boringssl_ffi_hmac_sha256(const uint8_t *key, size_t key_len,
+                                             const uint8_t *data, size_t data_len, uint8_t out[32]) {
+    unsigned int out_len = 0;
+    HMAC(EVP_sha256(), key, key_len, data, data_len, out, &out_len);
+}
+
+static inline int boringssl_ffi_hkdf_sha256(uint8_t *out, size_t out_len,
+                                            const uint8_t *secret, size_t secret_len,
+                                            const uint8_t *salt, size_t salt_len,
+                                            const uint8_t *info, size_t info_len) {
+    return HKDF(out, out_len, EVP_sha256(), secret, secret_len, salt, salt_len, info, info_len);
+}
+
+static inline void boringssl_ffi_x25519_keypair(uint8_t out_public[32], uint8_t out_private[32]) {
+    X25519_keypair(out_public, out_private);
+}
+
+static inline int boringssl_ffi_x25519(uint8_t out_shared[32], const uint8_t private_key[32],
+                                       const uint8_t peer_public[32]) {
+    return X25519(out_shared, private_key, peer_public);
+}
+
+static inline int boringssl_ffi_rand_bytes(uint8_t *out, size_t len) {
+    return RAND_bytes(out, len);
+}
