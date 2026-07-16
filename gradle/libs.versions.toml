@@ -26,6 +26,21 @@ boringsslQuicheAbi = "quiche 0.29.2 / boring-sys 4.22.0"
 # Android target can never drift apart.
 boringsslAndroidApi = "24"
 
+# ── Content-addressed variant (RFC §12 D8 — OPT-IN) ───────────────────────────────────────────────
+# The presence of `boringsslPrefix` is the catalog flag that authorizes BORINGSSL_PREFIX in the build
+# (the grep-gate one-unprefixed-copy invariant). When "true", the factory ALSO builds a symbol-PREFIXED
+# variant of `boringsslVariantCommit`, content-addressed as `b<hash8>` (letter + 8 hex), published under
+# distinct `-<alias>` coordinates ALONGSIDE the canonical unprefixed set. Paired with a generated
+# plain->b<hash>_ alias adapter (mechanism PROVEN end-to-end on ELF + Mach-O incl. asm: spikes/d8-alias-
+# shim), this lets a different BoringSSL (e.g. a DTLS-1.3 tree) coexist in-process with quiche's canonical
+# copy. Default "false" → the whole variant pipeline is inert and the canonical single-copy (D3) holds.
+boringsslPrefix = "false"
+# The commit to build the prefixed variant from. BLANK → the canonical `boringssl` pin above (a
+# content-addressed copy of the SAME tree — the quiche-adapter end-state, no second literal). Set to a
+# DIFFERENT 40-hex (e.g. boring 5.x's DTLS-1.3 tree, D1a) for true multi-version coexistence; that
+# second pin is sanctioned by the `boringsslPrefix` flag (grep-gate allows 2 distinct pins when set).
+boringsslVariantCommit = "canonical"
+
 [libraries]
 # Consumer modules add their own dependencies; nothing shared is needed for the phase-1 skeleton.
 

@@ -303,9 +303,14 @@ Two caveats carried by this pin:
 2. **D2 — Apple posture: ✅ COEXIST.** BoringSSL is opt-in on Apple only where mandatory (webrtc-dtls,
    quiche-external end-state); buffer-crypto keeps CryptoKit/CommonCrypto. Avoids shipping a multi-MB
    `libcrypto` into every iOS app.
-3. **D3 — prefix policy: ✅ UNPREFIXED + single-copy forever.** Matches every current `.def`. Add
-   `BORINGSSL_PREFIX` only if the FFM+`quiche_jni` same-process case is ever proven to collide (the
-   `validate-artifacts` single-copy `nm` guard is the tripwire). Given D1a=(1), one shared copy holds.
+3. **D3 — prefix policy: ✅ UNPREFIXED single-copy (operative today); generalized by D8.** Matches
+   every current `.def`. Given D1a=(1) only ONE BoringSSL commit is in use, so one shared unprefixed
+   copy holds and stays the operative policy (the `validate-artifacts` single-copy `nm` guard is the
+   tripwire). D8 (now RATIFIED — the alias-shim spike PROVED the mechanism, `spikes/d8-alias-shim`)
+   generalizes this to **"one copy per distinct commit, content-addressed"** for when >1 commit must
+   coexist in-process; when that day comes the factory prefixes by commit and quiche gets a generated
+   alias adapter (no blessed-unprefixed special case). Until a second commit is actually pinned, the
+   unprefixed single copy remains — D8 is the proven path, not an eager migration.
 4. **D4 — tvOS/watchOS: ✅ TRAIL.** No current consumer builds BoringSSL there and the cross-compile is
    unproven; gated behind the step-7 spike, shipped later if a triple resists. Blocks nothing.
 5. **D5 — build-system repo: ✅ DEFER.** Accept a 4th trimmed `build-logic` copy now; ship the
@@ -316,3 +321,70 @@ Two caveats carried by this pin:
    (drop `armeabi-v7a`, §5 Rule D). 24 is a modern floor covering the DTLS/QUIC datagram-seam devices;
    trivially bumpable, and the ecosystem-wide buffer/socket/webrtc minSdk raise is a separate coordinated
    change. Independent of DTLS 1.3.
+8. **D8 — content-addressed BoringSSL prefixing (multi-version): ✅ RATIFIED (2026-07-15, spike PROVEN).**
+   Generalizes **D3** ("one unprefixed copy forever") for when >1 BoringSSL commit must coexist in-process
+   — the **D1a option-(2)** scenario (quiche on API 21, webrtc-dtls wanting a newer DTLS-1.3 build).
+   Instead of a *consumer-name* prefix (`webrtc_`), prefix each build by its **BoringSSL commit**:
+   `BORINGSSL_PREFIX=b<hash8>` (letter + 8-hex — a C identifier can't start with a digit). Each copy is
+   then **content-addressed**:
+   - two consumers that pin the *same* commit get the *same* prefix → they **share one copy** (linker
+     dedup, reinforced by the content-addressed provision cache keyed at `…/<commit>/`);
+   - consumers pinning *different* commits get *different* prefixes → they **coexist, collision-free**.
+   The invariant upgrades from "exactly one copy" to **"exactly one copy per distinct commit in use, keyed
+   by content."**
+
+   **quiche adapter (the hard consumer).** `boring-sys` hardcodes *unprefixed* names in its Rust
+   `extern "C"` FFI, and the C-preprocessor prefix trick never reaches Rust — a prefixed `libcrypto` won't
+   satisfy it. Rather than fork/regenerate boring-sys, bridge it with a **generated link-time alias shim**:
+   `plain_name → b<hash>_name` aliases (signature-free), auto-generated from BoringSSL's own
+   `boringssl_prefix_symbols.h`, materialized per-platform (`--defsym`/`.set` on ELF, `-alias_list` on
+   Mach-O). quiche links the prefixed `.a` + the shim; its FFI resolves plain symbols to the
+   content-addressed impl and *shares* that copy with any prefixed-native consumer of the same commit.
+   Hard rule the shim obeys: **plain (unprefixed) symbols exist once per process** → exactly one
+   "shimmed-to-plain" consumer (quiche); everyone else (K/N cinterop, FFM shim, webrtc) binds `b<hash>_`
+   directly. End-state: **the factory always prefixes by commit; quiche gets a generated adapter; no
+   "blessed unprefixed" special case.**
+
+   **Soft dependency + graceful upgrade (dynamic surfaces only).** On the *dynamic* path (JVM FFM; largely
+   Android) a consumer compiles against the stable shim API — not a pinned commit — and a loader **probes**
+   which flavors are present, prefers the newest (DTLS 1.3 if the newer lib loads, else canonical), and
+   throws a **sealed `BoringSslException`** (`BoringSslUnavailable(coordinate, hint)`,
+   `BoringSslVersionMismatch`, the existing `BoringSslChecksumMismatch`) when none loads. DTLS also
+   negotiates on the wire, so degradation is graceful at two layers. **Boundary — this is *dynamic-linking*
+   semantics.** Static Kotlin/Native cinterop has **no runtime "missing library"** (an unresolved symbol is
+   a *build* error), so the variant is chosen at build time and the plugin's job is to turn a cryptic
+   linker `undefined b<hash>_…` into an actionable "provision pin X" message. **iOS** additionally forbids
+   fetch-and-`dlopen`, so on Apple the version is build-time-fixed.
+
+   **Gate — CLEARED (2026-07-15).** The spike (`spikes/d8-alias-shim`, CI `spike-d8.yaml`) proved the
+   alias mechanics **end-to-end on ELF and Mach-O, including asm-defined symbols**: a prefixed
+   `b<hash8>` libcrypto built at the canonical pin, a `plain → b<hash8>_` alias table generated from
+   `boringssl_prefix_symbols.h`, and a plain-symbol consumer (quiche/boring-sys stand-in) linked +
+   RUN against it — `SHA256` (C) and `ChaCha20_ctr32`/`sha256_block_data_order` (asm) all resolved to
+   the prefixed impls (Mach-O `ld64 -alias_list`; ELF `ld PROVIDE(...)` + `--whole-archive`, the same
+   whole-archive quiche already uses per §6). D8 is therefore **ratified as the target end-state**;
+   D3's single unprefixed copy remains operative until a second commit is pinned (build-out item 5
+   wires the `boringsslPrefix` catalog flag → prefixed build + generated adapter + distinct
+   `-<alias>` coordinate). The dynamic-loader half (sealed `BoringSslException` + flavor selection)
+   landed in `boringssl-jvm` (build-out item 3).
+9. **D9 — versioning & patch policy: 🔬 PROPOSED (2026-07-15).** A Maven version is one-dimensional and
+   must be monotonic; a BoringSSL commit is an *unordered* hash in a DAG — so the published version
+   **cannot** be the commit (no ordering, and 40-hex is unusable as a coordinate). Two independent axes,
+   projected thus:
+   - **Maven version = packaging semver** (`MAJOR.MINOR.PATCH`) — the *delivery* line (build recipe + shim
+     surface + provision plugin + bindings). **PATCH** = packaging-only, same BoringSSL + same shim ABI
+     (e.g. the checksum-baking fix → `0.0.2`); **MINOR** = additive (new shim fns / triples / an
+     ABI-compatible pin bump); **MAJOR** = breaking (BoringSSL ABI break, shim removal, or a
+     canonical-commit change that breaks single-copy consumers).
+   - **BoringSSL commit + patch-set = a pinned dimension, NOT the version** — recorded in the catalog (the
+     one pin), `provenance.json` (`boringsslCommit` + a new `patchSet` hash), and the BOM POM.
+   - **Multiple simultaneous commits = distinct coordinates/variants, not versions**
+     (`boringssl-jvm` + `boringssl-jvm-<alias>`), each on its own semver line, tied by the BOM — the commit
+     lives in the *coordinate*/provision-pin; the semver stays *packaging* (composes with **D8**).
+   - **Patches** (security backports / cherry-picks on top of the pin, before it moves): a
+     `boringssl-build/patches/*.patch` set applied to the fetched source pre-cmake; the ordered patch-set
+     hash folds into `provenance.json` **and** the build marker (so a patch change forces a rebuild and is
+     fully identified). Build-only patch → PATCH bump; behaviour/ABI-affecting patch → MINOR/MAJOR.
+
+   `0.0.1` (packaging semver, commit in provenance) is correct under this scheme as-is; **D9 shapes
+   `0.0.2+`** and the multi-version future. Ratify alongside D8.

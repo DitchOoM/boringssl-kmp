@@ -71,20 +71,35 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/build/boringssl/src
-          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       # THE big one: restore this triple's built archives; a hit turns the from-source build into a no-op.
       - name: Cache built BoringSSL archives (${{ matrix.triple }})
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/${{ matrix.triple }}
-          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map') }}
+          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map', 'boringssl-build/patches/**') }}
 
       - name: Build + floor-gate + package (${{ matrix.triple }})
         run: |
           ARGS=""
           [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
           ./gradlew :boringssl-build:${{ matrix.task }} $ARGS --stacktrace
+
+      # ── One-line consumer resolve (RFC §4 / item 1): publish the provision plugin to mavenLocal and
+      #    run samples/cinterop-consumer — a STANDALONE external build that gets K/N BoringSSL via
+      #    `boringssl.cinterop(linuxX64())` with NO hand-written .def. Runs natively on the x64 runner so
+      #    the container-built (glibc-2.17) archive links against K/N's glibc-2.19 floor and RUNS. Only
+      #    linuxX64 (K/N has no linux-aarch64 host target, so the arm64 runner can't run a K/N test).
+      - name: "Provision-plugin one-line cinterop consumer resolve (${{ matrix.triple }})"
+        if: ${{ matrix.triple == 'linuxX64' }}
+        run: |
+          BUNDLE_VERSION="${{ inputs.bundle_version != '' && inputs.bundle_version || '0.0.1-dev' }}"
+          ./gradlew :boringssl-provision:publishToMavenLocal --stacktrace
+          ./gradlew -p samples/cinterop-consumer linuxX64Test \
+            -PboringsslPluginVersion=0.0.1-SNAPSHOT \
+            -PboringsslBundleVersion="$BUNDLE_VERSION" \
+            --stacktrace
 
       - name: Upload ${{ matrix.triple }} bundle
         uses: actions/upload-artifact@v4

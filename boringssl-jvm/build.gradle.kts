@@ -132,6 +132,9 @@ run {
             mainComp.compileDependencyFiles,
             jvm21Comp.output.classesDirs,
         )
+        // Grant internal visibility of jvmMain (the flavor-probing loader seam) to the tests, so the
+        // backend-selection unit test can drive NativeLibraryLoader.select directly.
+        friendPaths.from(mainComp.output.classesDirs)
     }
 }
 

@@ -27,6 +27,15 @@ private val libs =
 val canonicalCommit: String = libs.findVersion("boringssl").get().requiredVersion
 val quicheAbi: String = libs.findVersion("boringsslQuicheAbi").get().requiredVersion
 
+// Content-addressed variant (RFC §12 D8) — opt-in. When boringsslPrefix="true", the BOM ALSO ties the
+// distinct `-<alias>` coordinates so a consumer that pins one variant gets a coherent set. The variant
+// commit + alias are recorded in the POM either way, so the BOM documents which BoringSSL trees coexist.
+val prefixEnabled: Boolean = libs.findVersion("boringsslPrefix").map { it.requiredVersion == "true" }.orElse(false)
+val variantCommit: String =
+    libs.findVersion("boringsslVariantCommit").map { it.requiredVersion }.orElse("canonical")
+        .let { if (it == "canonical" || it.isBlank()) canonicalCommit else it }
+val variantAlias: String = "b" + variantCommit.take(8)
+
 dependencies {
     constraints {
         // The coordinates the BOM pins — all at this release's version (from -Pversion). The BOM never
@@ -34,6 +43,13 @@ dependencies {
         api("com.ditchoom.boringssl:boringssl-provision:${project.version}")
         api("com.ditchoom.boringssl:boringssl-jvm:${project.version}")
         api("com.ditchoom.boringssl:boringssl-android:${project.version}")
+        // The content-addressed variant coordinates, tied to the SAME packaging version (D8). Guarded on
+        // the flag that produces them, so the BOM pins them exactly when they publish (item 5 follow-up
+        // wires the -<alias> jvm/android artifacts; the build-side variant tarball lands in this PR).
+        if (prefixEnabled) {
+            api("com.ditchoom.boringssl:boringssl-jvm-$variantAlias:${project.version}")
+            api("com.ditchoom.boringssl:boringssl-android-$variantAlias:${project.version}")
+        }
     }
 }
 

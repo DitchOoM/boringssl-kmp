@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# D8 alias-shim spike (RFC §12 D8) — the GATE before D8 can be ratified and D3 relaxed.
+#
+# Runs spikes/d8-alias-shim/run.sh on BOTH object formats to prove the content-addressed prefixing +
+# generated plain->b<hash>_ alias adapter end-to-end, INCLUDING asm-defined symbols:
+#   • elf   (ubuntu-24.04)  — ld linker-script aliases
+#   • macho (macos-14)      — ld64 -alias_list aliases
+#
+# Not part of the release path; manual + on push to the spike branch. Cheap (builds only libcrypto).
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+name: "Spike: D8 alias-shim"
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: ["spike/d8-alias-shim"]
+    paths:
+      - "spikes/d8-alias-shim/**"
+      - ".github/workflows/spike-d8.yaml"
+
+concurrency:
+  group: spike-d8-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  alias-shim:
+    name: "alias-shim (${{ matrix.platform }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, platform: elf }
+          - { os: macos-14, platform: macho }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install build tools (cmake + ninja + perl)
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ninja-build cmake perl
+          else
+            brew install ninja >/dev/null || true
+          fi
+          cmake --version && ninja --version && go version
+
+      - name: Run the D8 alias-shim spike (${{ matrix.platform }})
+        run: bash spikes/d8-alias-shim/run.sh ${{ matrix.platform }}
