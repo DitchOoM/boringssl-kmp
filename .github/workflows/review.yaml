@@ -48,8 +48,10 @@ jobs:
             exit 1
           fi
       - name: "No BORINGSSL_PREFIX unless catalog-flagged (one-unprefixed-copy invariant)"
+        # spikes/** are throwaway experiments (like docs + .github), NOT the production build path —
+        # the D8 alias-shim spike legitimately builds a prefixed libcrypto to prove the mechanism.
         run: |
-          if git grep -nE 'BORINGSSL_PREFIX' -- ':!*.md' ':!.github/**' && ! grep -q 'boringsslPrefix' gradle/libs.versions.toml ; then
+          if git grep -nE 'BORINGSSL_PREFIX' -- ':!*.md' ':!.github/**' ':!spikes/**' && ! grep -q 'boringsslPrefix' gradle/libs.versions.toml ; then
             echo "::error::BORINGSSL_PREFIX used without the catalog flag"
             exit 1
           fi
