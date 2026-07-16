@@ -211,6 +211,11 @@ artifacts to Maven Central and the tarballs to GitHub Releases.
 - **Content-addressed variants (advanced, opt-in — RFC §12 D8):** when more than one BoringSSL commit
   must coexist in one process (e.g. quiche's canonical copy + a newer DTLS-1.3 build), the factory can
   emit a symbol-prefixed `b<hash8>` variant under distinct `-<alias>` coordinates with a generated
-  alias adapter. Off by default (single unprefixed copy); see the RFC for the design.
+  alias adapter. Off by default (single unprefixed copy); see the RFC for the design. A K/N consumer
+  pins a variant by passing its alias — the plugin links the prefixed archive + the adapter for you:
+
+  ```kotlin
+  boringssl.cinterop(target, cinteropName = "boringsslV", alias = "b1a2b3c4d")
+  ```
 
 Licensed under Apache-2.0. BoringSSL carries its own (ISC/OpenSSL-style) license.
