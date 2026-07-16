@@ -7,7 +7,8 @@ cross-compiling its own copy, this repo builds **one pinned commit** across the 
 ships **checksum-pinned prebuilt bundles** you drop into your build.
 
 > It is a **binary factory**, not a klib library. It ships the *ingredients* (headers + static archives +
-> a JVM shared library); you keep your own binding `.def`/JNI glue.
+> a JVM shared library). K/N gets a **one-line cinterop** with a canonical default `.def`; JVM is a
+> ready-to-call API; Android ships a prefab AAR you link your JNI shim against.
 
 **Canonical pin:** `google/boringssl @ 44b3df6f` (BoringSSL API 21) — the exact tree
 `boring-sys 4.22.0` vendors for `quiche 0.29.2`. That commit is the single source of truth; the pin
@@ -56,12 +57,32 @@ val random   = BoringSsl.randomBytes(32)
 Run with `--enable-native-access=ALL-UNNAMED` (the JAR manifest already declares it, so on most JDKs no
 flag is needed). Bundled JVM platforms: `linux-x86_64`, `linux-aarch64`, `macos-x86_64`, `macos-aarch64`.
 
-### Kotlin/Native (Linux **and** Apple) — cinterop via the provision plugin
+The loader picks the native library for the running OS/arch automatically on first use. Inspect what
+was selected, and handle the "no backend" case with a typed error:
 
-Apple and Linux consume BoringSSL the **same way**: the provision plugin downloads the per-triple
-tarball from GitHub Releases, verifies it against a **baked-in sha256** (no trust-on-first-use), extracts
-it to `~/.gradle/caches/ditchoom-boringssl/<version>/<triple>/{include,lib}`, and hands you the path.
-You supply your own `.def` (headers + any `static inline` wrappers) — we ship the ingredients.
+```kotlin
+import com.ditchoom.boringssl.BoringSsl
+import com.ditchoom.boringssl.BoringSslUnavailable
+
+try {
+    val info = BoringSsl.backendInfo()   // flavor, coordinate, supportsDtls13, versionNumber
+    println("BoringSSL ${info.flavor} (DTLS 1.3: ${info.supportsDtls13})")
+} catch (e: BoringSslUnavailable) {
+    // JDK < 21, or no native library bundled for this OS/arch — e.hint says what to do.
+    error("${e.coordinate}: ${e.hint}")
+}
+```
+
+All failures are a sealed `BoringSslException` (`BoringSslUnavailable`, `BoringSslVersionMismatch`,
+`BoringSslChecksumMismatch`), so a `when` over a caught exception is exhaustive.
+
+### Kotlin/Native (Linux **and** Apple) — one line per target
+
+Apple and Linux consume BoringSSL the **same way**. Apply the provision plugin and call
+`boringssl.cinterop(target)` — that's the whole integration. The helper provisions the per-triple
+tarball (downloads from GitHub Releases → verifies against a **baked-in sha256**, no trust-on-first-use
+→ extracts to `~/.gradle/caches/ditchoom-boringssl/<version>/<triple>/`), then wires a cinterop against
+a **canonical `.def` shipped by the plugin** — so you don't hand-write one:
 
 ```kotlin
 // build.gradle.kts
@@ -71,29 +92,33 @@ plugins {
 }
 
 kotlin {
-    // Every Linux + Apple triple wires up identically:
     listOf(linuxX64(), macosArm64(), iosArm64(), iosSimulatorArm64(), iosX64()).forEach { target ->
-        target.compilations.getByName("main").cinterops.create("boringssl") {
-            // downloads + sha256-verifies + extracts on first use; returns {include, lib}
-            val bssl = boringssl.boringsslDir(target.targetName)
-            defFile("src/nativeInterop/cinterop/boringssl.def")
-            includeDirs(bssl.resolve("include"))
-            extraOpts("-libraryPath", bssl.resolve("lib").path)
-        }
+        boringssl.cinterop(target)   // ← provisions + wires cinterop; no .def, no library paths
     }
 }
 ```
 
-```properties
-# src/nativeInterop/cinterop/boringssl.def
-headers = openssl/ssl.h openssl/crypto.h openssl/sha.h
-staticLibraries = libssl.a libcrypto.a
-# Apple auto-links libSystem; on Linux add: linkerOpts = -lpthread -ldl
+That generates a `com.ditchoom.boringssl` cinterop with two layers of surface:
+
+- **BoringSSL's real headers** (`openssl/ssl.h`, `openssl/aead.h`, …) — call `SSL_CTX_new(...)`,
+  `EVP_AEAD_CTX_seal(...)`, etc. directly;
+- the curated **`boringssl_ffi_*`** wrappers (the macro-heavy primitives re-exposed as concrete
+  symbols — the *same* surface the JVM `BoringSsl` API is built on): `boringssl_ffi_sha256(...)`,
+  `boringssl_ffi_hkdf_sha256(...)`, `boringssl_ffi_x25519(...)`, …
+
+```kotlin
+import com.ditchoom.boringssl.boringssl_ffi_sha256   // from the wired cinterop
 ```
+
+Need a different symbol set? Pass your own def — the provisioning + link wiring still applies:
+`boringssl.cinterop(target, def = file("src/nativeInterop/cinterop/my.def"))`. (The low-level
+`boringssl.boringsslDir(triple) -> {include, lib}` is still there if you want to wire cinterop by hand.)
+
+A complete, runnable example lives in [`samples/cinterop-consumer/`](samples/cinterop-consumer).
 
 Supported K/N triples (12): `linuxX64`, `linuxArm64`, `macosX64`, `macosArm64`, `iosArm64`,
 `iosSimulatorArm64`, `iosX64`, `tvosArm64`, `tvosSimulatorArm64`, `tvosX64`, `watchosSimulatorArm64`,
-`watchosX64`. Call `boringsslDir(triple)` with the Kotlin/Native target name (which equals the triple).
+`watchosX64` (the K/N target name equals the triple).
 
 ### Android (NDK / JNI) — prefab AAR
 
@@ -183,5 +208,9 @@ artifacts to Maven Central and the tarballs to GitHub Releases.
 
 - [`RFC_BORINGSSL_KMP.md`](RFC_BORINGSSL_KMP.md) — the plan of record (matrix, distribution, decisions).
 - [`CLAUDE.md`](CLAUDE.md) — repo conventions + standing directives.
+- **Content-addressed variants (advanced, opt-in — RFC §12 D8):** when more than one BoringSSL commit
+  must coexist in one process (e.g. quiche's canonical copy + a newer DTLS-1.3 build), the factory can
+  emit a symbol-prefixed `b<hash8>` variant under distinct `-<alias>` coordinates with a generated
+  alias adapter. Off by default (single unprefixed copy); see the RFC for the design.
 
 Licensed under Apache-2.0. BoringSSL carries its own (ISC/OpenSSL-style) license.
