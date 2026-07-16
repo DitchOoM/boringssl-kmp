@@ -171,6 +171,19 @@ val patchSetHash: String =
     }
 val patchSetNames: List<String> = orderedPatches().map { it.name }
 
+// ── Content-addressed variant (RFC §12 D8 — opt-in via the `boringsslPrefix` catalog flag) ──────────
+// When boringsslPrefix="true", the factory ALSO builds a symbol-PREFIXED variant of boringsslVariantCommit
+// (BLANK → the canonical pin), content-addressed as `b<hash8>`, packaged under a DISTINCT `-<alias>`
+// coordinate with a generated plain->b<hash>_ alias adapter (the mechanism proven in spikes/d8-alias-shim).
+// Default false → the whole variant pipeline is inert (D3 single-copy holds).
+val prefixEnabled: Boolean =
+    catalog.findVersion("boringsslPrefix").map { it.requiredVersion == "true" }.orElse(false)
+val variantCommit: String =
+    catalog.findVersion("boringsslVariantCommit").map { it.requiredVersion }.orElse("canonical")
+        .let { if (it == "canonical" || it.isBlank()) boringsslCommit else it }
+val variantAlias: String = "b" + variantCommit.take(8)
+val variantScript = projectDir.resolve("scripts/build-prefixed-variant.sh")
+
 // ── Shared source fetch + patch: clone google/boringssl @ the pinned commit, apply the patch set ──
 val fetchBoringSsl =
     tasks.register("fetchBoringSsl") {
@@ -253,9 +266,15 @@ fun sha256Of(f: File): String {
 // SORTED relative-path list in `ustar` format — a recipe both bsdtar and GNU tar honour identically, so
 // the archive is byte-stable across the local mac and the macos-14 runner (the Apple analog of the
 // Linux GNU-tar reproducibility recipe). Packs `include` + `lib` under `root`, minus `excludeNames`.
-fun deterministicApplePackage(root: File, tarFile: File, epoch: String, excludeNames: Regex) {
+fun deterministicApplePackage(
+    root: File,
+    tarFile: File,
+    epoch: String,
+    excludeNames: Regex,
+    tops: List<String> = listOf("include", "lib"),
+) {
     val entries =
-        listOf("include", "lib").flatMap { top ->
+        tops.flatMap { top ->
             root.resolve(top).walkTopDown()
                 .filter { it.isFile && !excludeNames.matches(it.name) }
                 .map { it.relativeTo(root).path }.toList()
@@ -1261,10 +1280,144 @@ val packageApple =
         }
     }
 
+// ── Content-addressed prefixed variant (RFC §12 D8 — opt-in) ────────────────────────────────────────
+// When boringsslPrefix="true", build a symbol-PREFIXED (b<hash8>) variant of `variantCommit` per Apple
+// triple + its plain->b<hash>_ alias adapter (via scripts/build-prefixed-variant.sh — the productionized
+// spike), packaged as the DISTINCT `-<alias>` coordinate `boringssl-<ver>-<triple>-<alias>.tar.gz`. The
+// variant coexists in-process with the canonical unprefixed copy (quiche's) with no symbol collision.
+// Linux/Android variant lanes drive the SAME script with their toolchain args (follow-up); Apple is the
+// runtime-validated proof here. Inert unless the flag is set.
+
+// Variant source: reuse the canonical clone when the commit matches (no second literal); else a
+// dedicated shallow clone of the variant commit (unpatched — the patch axis D9 rides the canonical pin).
+val fetchBoringSslVariant =
+    if (variantCommit == boringsslCommit) {
+        fetchBoringSsl
+    } else {
+        tasks.register("fetchBoringSslVariant") {
+            group = "boringssl"
+            description = "Clone google/boringssl @ $variantCommit for the content-addressed variant (D8)."
+            val vSrc = boringsslWork.get().dir("variant-src").asFile
+            inputs.property("variantCommit", variantCommit)
+            outputs.dir(vSrc)
+            onlyIf { !File(vSrc, "CMakeLists.txt").exists() }
+            doLast {
+                vSrc.deleteRecursively(); vSrc.mkdirs()
+                fun git(vararg a: String) =
+                    ProcessBuilder(listOf("git", *a)).directory(vSrc).redirectErrorStream(true).start()
+                        .also { it.inputStream.bufferedReader().forEachLine { l -> logger.lifecycle(l) } }.waitFor()
+                logger.lifecycle("Fetching google/boringssl @ $variantCommit (D8 variant)...")
+                if (git("init", "-q") != 0) throw GradleException("git init failed (variant)")
+                git("remote", "add", "origin", "https://github.com/google/boringssl.git")
+                if (git("fetch", "--depth", "1", "origin", variantCommit) != 0) {
+                    throw GradleException("Failed to fetch google/boringssl @ $variantCommit (variant)")
+                }
+                if (git("checkout", "-q", "FETCH_HEAD") != 0) throw GradleException("Failed to checkout $variantCommit (variant)")
+            }
+        }
+    }
+val variantSrcDir =
+    if (variantCommit == boringsslCommit) boringsslWork.get().dir("src").asFile else boringsslWork.get().dir("variant-src").asFile
+
+fun registerAppleVariant(t: AppleTriple): TaskProvider<Task> {
+    val cap = t.id.replaceFirstChar { it.uppercase() }
+    val outDir = projectDir.resolve("libs/boringssl/${t.id}-$variantAlias")
+    val libDir = outDir.resolve("lib")
+    // patchSetHash folds in so a patch change rebuilds the variant when it reuses the (patched) canonical tree.
+    val marker = libDir.resolve(".variant-$variantCommit-$variantAlias-p$patchSetHash-min${t.minVersion}")
+
+    val build =
+        tasks.register("buildBoringSslVariantApple$cap") {
+            group = "boringssl"
+            description = "Build the content-addressed b<hash8> PREFIXED variant + alias adapter for ${t.id} (D8)."
+            onlyIf { prefixEnabled && isMacHost }
+            dependsOn(fetchBoringSslVariant)
+            inputs.property("variantCommit", variantCommit)
+            inputs.property("prefix", variantAlias)
+            inputs.file(variantScript)
+            outputs.dir(outDir)
+            doLast {
+                if (marker.exists() && libDir.resolve("libcrypto.a").exists()) {
+                    logger.lifecycle("Apple variant ${t.id}-$variantAlias: up-to-date — skipping.")
+                    return@doLast
+                }
+                outDir.deleteRecursively()
+                val sysroot = xcrunSdkPath(t.sdk)
+                val cmakeExtra =
+                    buildList {
+                        add("-DCMAKE_OSX_SYSROOT=$sysroot")
+                        add("-DCMAKE_OSX_ARCHITECTURES=${t.arch}")
+                        add("-DCMAKE_OSX_DEPLOYMENT_TARGET=${t.minVersion}")
+                        if (t.systemName != null) add("-DCMAKE_SYSTEM_NAME=${t.systemName}")
+                    }
+                logger.lifecycle("Building content-addressed variant $variantAlias for ${t.id} (${t.sdk}, ${t.arch})...")
+                runOrThrow(
+                    "bash", variantScript.absolutePath,
+                    "--src", variantSrcDir.absolutePath, "--out", outDir.absolutePath,
+                    "--prefix", variantAlias, "--format", "macho", "--", *cmakeExtra.toTypedArray(),
+                    dir = projectDir, what = "prefixed variant ${t.id}",
+                )
+                require(libDir.resolve("libcrypto.a").exists()) { "variant libcrypto.a missing for ${t.id}" }
+                writeMarker(marker, ".variant-", "google/boringssl @ $variantCommit PREFIX=$variantAlias ${t.id}\n")
+                logger.lifecycle("Content-addressed variant built: ${t.id}-$variantAlias → $libDir")
+            }
+        }
+
+    return tasks.register("packageBoringSslVariantApple$cap") {
+        group = "boringssl"
+        description = "Package the ${t.id} b<hash8> variant into boringssl-$bundleVersion-${t.id}-$variantAlias.tar.gz (D8)."
+        onlyIf { prefixEnabled && isMacHost }
+        dependsOn(build)
+        doLast {
+            val dist = distDir.get().asFile.apply { mkdirs() }
+            val tarFile = dist.resolve("boringssl-$bundleVersion-${t.id}-$variantAlias.tar")
+            val tarGz = dist.resolve("boringssl-$bundleVersion-${t.id}-$variantAlias.tar.gz")
+            tarGz.delete()
+            // Package lib/ + include/ + adapter/ (the generated plain->b<hash>_ alias tables + prefix header).
+            deterministicApplePackage(
+                outDir, tarFile, sourceDateEpoch, Regex("""^\.variant-.*$"""),
+                tops = listOf("include", "lib", "adapter"),
+            )
+            runOrThrow("gzip", "-nf", tarFile.absolutePath, dir = dist, what = "gzip ${t.id}-$variantAlias")
+            val digest = sha256Of(tarGz)
+            dist.resolve("${tarGz.name}.sha256").writeText("$digest  ${tarGz.name}\n")
+            dist.resolve("boringssl-$bundleVersion-${t.id}-$variantAlias.provenance.json").writeText(
+                """
+                {
+                  "artifact": "${tarGz.name}",
+                  "sha256": "$digest",
+                  "variant": true,
+                  "boringsslCommit": "$variantCommit",
+                  "prefix": "$variantAlias",
+                  "alias": "$variantAlias",
+                  "quicheAbi": "${catalog.findVersion("boringsslQuicheAbi").get().requiredVersion}",
+                  "triple": "${t.id}",
+                  "appleSdk": "${t.sdk}",
+                  "deploymentTarget": "${t.minVersion}",
+                  "bundleVersion": "$bundleVersion",
+                  "sourceDateEpoch": $sourceDateEpoch
+                }
+                """.trimIndent() + "\n",
+            )
+            logger.lifecycle("Packaged variant ${t.id}-$variantAlias: ${tarGz.name}  sha256=$digest")
+        }
+    }
+}
+
+val appleVariantPackages = appleTriples.map { registerAppleVariant(it) }
+
+tasks.register("buildBoringSslVariantApple") {
+    group = "boringssl"
+    description = "Build the content-addressed b<hash8> variant for all Apple triples (D8; needs boringsslPrefix=true)."
+    onlyIf { prefixEnabled }
+    dependsOn(appleVariantPackages)
+}
+
 // `assemble` produces the distributable tarballs. Apple rides along only on a macOS host (the Apple
 // tasks require Xcode); Linux/CI runners that invoke a specific packageBoringSsl<Triple> task are
-// unaffected.
+// unaffected. The content-addressed variant rides along only when boringsslPrefix="true".
 tasks.named("assemble") {
     dependsOn(packageLinux)
     if (isMacHost) dependsOn(packageApple)
+    if (isMacHost && prefixEnabled) dependsOn(appleVariantPackages)
 }
