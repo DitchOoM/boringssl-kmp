@@ -71,13 +71,23 @@ open class BoringSslProvisionExtension(private val project: Project) {
      * Returns `<cacheRoot>/<version>/<triple>` containing `{include, lib}`, materialising (download →
      * verify → extract) on first use. Safe to call from a cinterop configuration block.
      */
-    fun boringsslDir(triple: String): File {
-        val dest = File(cacheRoot, "$version/$triple")
+    fun boringsslDir(triple: String): File = boringsslDir(triple, null)
+
+    /**
+     * Variant-aware provisioning (RFC §12 D8). [alias] null → the canonical unprefixed bundle; a
+     * content-addressed `b<hash8>` [alias] → the PREFIXED variant `boringssl-<ver>-<triple>-<alias>.tar.gz`,
+     * whose `lib/` holds the `b<hash>_`-prefixed archives and `adapter/` the generated plain->b<hash>_
+     * alias table. Extracted to `<cacheRoot>/<version>/<triple>[-<alias>]/`.
+     */
+    fun boringsslDir(triple: String, alias: String?): File {
+        val suffix = alias?.let { "-$it" } ?: ""
+        val key = "$triple$suffix"
+        val dest = File(cacheRoot, "$version/$key")
         val marker = File(dest, ".provisioned-$version")
         if (marker.exists() && File(dest, "lib").isDirectory && File(dest, "include").isDirectory) return dest
 
-        val tarName = "boringssl-$version-$triple.tar.gz"
-        val (tarball, expected) = resolveTarball(triple, tarName)
+        val tarName = "boringssl-$version-$key.tar.gz"
+        val (tarball, expected) = resolveTarball(key, tarName)
         val actual = sha256(tarball)
         if (!expected.equals(actual, ignoreCase = true)) {
             throw GradleException("BoringSSL bundle checksum mismatch for $triple: expected $expected, got $actual (from ${tarball.absolutePath})")
@@ -115,10 +125,12 @@ open class BoringSslProvisionExtension(private val project: Project) {
         cinteropName: String = "boringssl",
         triple: String = target.name,
         def: File? = null,
+        alias: String? = null,
     ) {
-        val dir = boringsslDir(triple)
+        val dir = boringsslDir(triple, alias)
         val includeDir = File(dir, "include")
         val libDir = File(dir, "lib")
+        val isLinux = triple.startsWith("linux")
 
         val baseDefText =
             def?.readText()
@@ -129,28 +141,49 @@ open class BoringSslProvisionExtension(private val project: Project) {
 
         val sep = baseDefText.indexOf("\n---")
         require(sep > 0) { "boringssl.cinterop: def is missing the '---' separator (def=${def?.absolutePath ?: "canonical"})" }
-
-        // glibc floors (K/N linuxX64/Arm64) keep pthread + dl in separate libs; Apple auto-links
-        // libSystem, so there is nothing to add there. Only inject if the base def declares no linkerOpts.
-        val linkerOpts = if (triple.startsWith("linux")) "-lpthread -ldl" else ""
         val baseDeclaresLinker = Regex("(?m)^\\s*linkerOpts\\s*=").containsMatchIn(baseDefText.substring(0, sep))
-        val injected =
-            buildString {
-                append(baseDefText, 0, sep)
-                append("\nlibraryPaths = ").append(libDir.absolutePath)
-                append("\nstaticLibraries = libssl.a libcrypto.a")
-                if (linkerOpts.isNotEmpty() && !baseDeclaresLinker) append("\nlinkerOpts = ").append(linkerOpts)
-                append("\n")
-                append(baseDefText, sep, baseDefText.length)
+
+        // The link config to inject before `---`. For the canonical bundle: staticLibraries + the
+        // platform floor libs. For a content-addressed VARIANT (D8): the headers are still plain, but the
+        // archives export `b<hash>_` symbols, so the generated alias adapter maps the consumer's plain
+        // refs onto them — Mach-O via ld64 `-alias_list` (lazy), ELF via `--whole-archive` + the PROVIDE
+        // script (matching how quiche consumes the external libcrypto, RFC §6).
+        val linkLines =
+            if (alias == null) {
+                buildString {
+                    append("\nlibraryPaths = ").append(libDir.absolutePath)
+                    append("\nstaticLibraries = libssl.a libcrypto.a")
+                    // glibc floors keep pthread + dl separate (linux); Apple auto-links libSystem.
+                    if (isLinux && !baseDeclaresLinker) append("\nlinkerOpts = -lpthread -ldl")
+                }
+            } else {
+                val adapter = File(dir, "adapter/" + if (isLinux) "aliases.elf.ld" else "aliases.macho")
+                require(adapter.exists()) {
+                    "boringssl.cinterop(alias=$alias): variant adapter missing ($adapter) — not a prefixed -<alias> bundle."
+                }
+                val ssl = libDir.resolve("libssl.a").absolutePath
+                val crypto = libDir.resolve("libcrypto.a").absolutePath
+                // Whole-archive the prefixed libs so EVERY alias target is defined (the full plain->b<hash>_
+                // table references crypto+ssl symbols; a lazy link would leave the unreferenced ones
+                // dangling). This is exactly how quiche consumes the external libcrypto (RFC §6). K/N passes
+                // linkerOpts STRAIGHT to ld, so these are raw ld64/GNU-ld options (no `-Wl,` driver prefix).
+                if (isLinux) {
+                    "\nlinkerOpts = --whole-archive $ssl $crypto --no-whole-archive ${adapter.absolutePath} -lpthread -ldl"
+                } else {
+                    "\nlinkerOpts = -force_load $ssl -force_load $crypto -alias_list ${adapter.absolutePath}"
+                }
             }
+
+        val injected = baseDefText.substring(0, sep) + linkLines + "\n" + baseDefText.substring(sep)
+        val suffix = alias?.let { "-$it" } ?: ""
         val generatedDef =
-            File(project.layout.buildDirectory.get().asFile, "generated/cinterop/$cinteropName-$triple.def")
+            File(project.layout.buildDirectory.get().asFile, "generated/cinterop/$cinteropName-$triple$suffix.def")
                 .apply { parentFile.mkdirs(); writeText(injected) }
 
         val settings = target.compilations.getByName("main").cinterops.create(cinteropName)
         settings.defFile(generatedDef)
         settings.includeDirs(includeDir)
-        project.logger.info("boringssl.cinterop: wired '$cinteropName' for $triple → def=${generatedDef.absolutePath}")
+        project.logger.info("boringssl.cinterop: wired '$cinteropName' for $triple$suffix → def=${generatedDef.absolutePath}")
     }
 
     /** Resolve the tarball (local dist or download) and its expected checksum. */
