@@ -90,7 +90,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/build/boringssl/src
-          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml') }}
+          key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       # THE big one: restore this triple's built archives + dylib; a hit turns the build into a no-op.
       # Keyed on the commit + the Apple build/shim recipe (build.gradle.kts + the FFM shim surface).
@@ -98,7 +98,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: boringssl-build/libs/boringssl/${{ matrix.triple }}
-          key: bssl-apple-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/build.gradle.kts', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c') }}
+          key: bssl-apple-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/build.gradle.kts', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/patches/**') }}
 
       # Build + per-SDK link-smoke + package (the pkg task dependsOn build + linkFfi + smoke).
       - name: Build + link-smoke + package (${{ matrix.triple }})

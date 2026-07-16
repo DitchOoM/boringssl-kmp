@@ -146,14 +146,45 @@ fun ensureImage(arch: String, platform: String, tag: String) {
 val boringsslWork = layout.buildDirectory.dir("boringssl")
 val distDir = layout.buildDirectory.dir("dist")
 
-// ── Shared source fetch: clone google/boringssl @ the pinned commit exactly once ──
+// ── Patch axis (RFC §12 D9) ───────────────────────────────────────────────────────────────────────
+// Ordered `*.patch` files under boringssl-build/patches/ are applied to the fetched BoringSSL source
+// with `git apply -p1` in FILENAME order (convention: `NN-description.patch`), BEFORE any cmake. The
+// ordered patch-set hash (names + contents) folds into EVERY build marker AND provenance.json, so a
+// patch change forces a rebuild and is fully identified (a build-only patch → PATCH bump; a
+// behaviour/ABI-affecting patch → MINOR/MAJOR — see patches/README.md).
+//
+// At the canonical pin the set is EMPTY: plain google/boringssl @ the pin is expected to satisfy the
+// quiche `ffi,qlog` link-smoke (the boring-sys feature patches add symbols without changing the ABI —
+// RFC §10). If that link-smoke ever fails, drop the needed patches here. An empty set hashes to a
+// stable constant, so the machinery is inert until a patch is added.
+val patchesDir = projectDir.resolve("patches")
+
+fun orderedPatches(): List<File> =
+    patchesDir.listFiles { f -> f.isFile && f.name.endsWith(".patch") }?.sortedBy { it.name } ?: emptyList()
+
+// Content-address the ordered patch set by (name + bytes) of each patch, in order. Empty → constant.
+val patchSetHash: String =
+    run {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        orderedPatches().forEach { md.update(it.name.toByteArray()); md.update(it.readBytes()) }
+        md.digest().joinToString("") { "%02x".format(it) }.take(12)
+    }
+val patchSetNames: List<String> = orderedPatches().map { it.name }
+
+// ── Shared source fetch + patch: clone google/boringssl @ the pinned commit, apply the patch set ──
 val fetchBoringSsl =
     tasks.register("fetchBoringSsl") {
         group = "boringssl"
-        description = "Clone google/boringssl @ $boringsslCommit (shallow, exact SHA)."
+        description = "Clone google/boringssl @ $boringsslCommit (shallow, exact SHA) + apply patches/ (D9)."
         val srcDir = boringsslWork.get().dir("src").asFile
+        // The patchset marker records WHICH patch set the checked-out tree carries; a patch change
+        // flips the hash so the tree is re-prepared (clean checkout + re-apply), never left half-patched.
+        val patchMarker = File(srcDir, ".patchset-$patchSetHash")
+        inputs.property("commit", boringsslCommit)
+        inputs.property("patchSet", patchSetHash)
+        orderedPatches().forEach { inputs.file(it) }
         outputs.dir(srcDir)
-        onlyIf { !File(srcDir, "CMakeLists.txt").exists() }
+        onlyIf { !(File(srcDir, "CMakeLists.txt").exists() && patchMarker.exists()) }
         doLast {
             srcDir.deleteRecursively(); srcDir.mkdirs()
             fun git(vararg a: String) =
@@ -166,6 +197,27 @@ val fetchBoringSsl =
                 throw GradleException("Failed to fetch google/boringssl @ $boringsslCommit")
             }
             if (git("checkout", "-q", "FETCH_HEAD") != 0) throw GradleException("Failed to checkout $boringsslCommit")
+
+            // Apply the ordered patch set (D9). `git apply -p1 --check` first so a bad patch fails loud
+            // BEFORE mutating the tree; then apply. Filename order = apply order.
+            val patches = orderedPatches()
+            patches.forEach { p ->
+                logger.lifecycle("Applying patch ${p.name} (git apply -p1)...")
+                if (git("apply", "-p1", "--check", p.absolutePath) != 0) {
+                    throw GradleException("Patch ${p.name} does NOT apply cleanly to $boringsslCommit (git apply --check failed).")
+                }
+                if (git("apply", "-p1", p.absolutePath) != 0) {
+                    throw GradleException("Failed to apply patch ${p.name}.")
+                }
+            }
+            patchMarker.writeText(
+                "boringssl @ $boringsslCommit + patchSet=$patchSetHash [${patches.joinToString(",") { it.name }.ifEmpty { "none" }}]\n",
+            )
+            if (patches.isEmpty()) {
+                logger.lifecycle("No patches to apply (empty patch set, hash $patchSetHash).")
+            } else {
+                logger.lifecycle("Applied ${patches.size} patch(es) [$patchSetHash]: ${patches.joinToString(", ") { it.name }}")
+            }
         }
     }
 
@@ -318,8 +370,8 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
     // .so (see RFC §10). Both fold in the commit + image (toolchain) hash; the archive marker adds the
     // archive recipe, and the ffi marker adds the archive recipe AND the shim hash (a new commit /
     // toolchain / archive-recipe rebuilds the .a AND forces a relink; a shim edit forces only a relink).
-    val archiveMarker = outDir.resolve("lib/.archives-$boringsslCommit-$imageHash-$archiveRecipeHash")
-    val ffiMarker = outDir.resolve("lib/.ffi-$boringsslCommit-$imageHash-$archiveRecipeHash-$shimHash")
+    val archiveMarker = outDir.resolve("lib/.archives-$boringsslCommit-p$patchSetHash-$imageHash-$archiveRecipeHash")
+    val ffiMarker = outDir.resolve("lib/.ffi-$boringsslCommit-p$patchSetHash-$imageHash-$archiveRecipeHash-$shimHash")
     val crossing = t.crossCc != null && System.getProperty("os.arch") != "aarch64"
     val libDir = outDir.resolve("lib")
 
@@ -554,6 +606,8 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                       "sha256": "$digest",
                       "boringsslCommit": "$boringsslCommit",
                       "boringsslApiVersion": $boringsslApiVersion,
+                      "patchSet": "$patchSetHash",
+                      "patches": [${patchSetNames.joinToString(", ") { "\"$it\"" }}],
                       "quicheAbi": "${catalog.findVersion("boringsslQuicheAbi").get().requiredVersion}",
                       "triple": "${t.id}",
                       "bundleVersion": "$bundleVersion",
@@ -699,7 +753,7 @@ fun registerAndroidAbi(a: AndroidAbi): Triple<TaskProvider<Task>, List<TaskProvi
                         "Android build needs an NDK: set ANDROID_NDK_HOME or install one under \$ANDROID_HOME/ndk. " +
                             "CI provides it via the setup-android action.",
                     )
-                val marker = libDir.resolve(".android-$boringsslCommit-ndk$ndkVersion-api$boringsslAndroidApi")
+                val marker = libDir.resolve(".android-$boringsslCommit-p$patchSetHash-ndk$ndkVersion-api$boringsslAndroidApi")
                 if (marker.exists() && libDir.resolve("libcrypto.a").exists()) {
                     logger.lifecycle("Android ${a.abi}: up-to-date ($marker) — skipping.")
                     return@doLast
@@ -974,7 +1028,7 @@ fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider
                     throw GradleException("Apple builds require a macOS host with Xcode — CI runs this lane on macos-14.")
                 }
                 val toolId = appleToolchainId()
-                val marker = libDir.resolve(".apple-$boringsslCommit-$toolId-min${t.minVersion}")
+                val marker = libDir.resolve(".apple-$boringsslCommit-p$patchSetHash-$toolId-min${t.minVersion}")
                 if (marker.exists() && libDir.resolve("libcrypto.a").exists()) {
                     logger.lifecycle("Apple ${t.id}: up-to-date ($marker) — skipping.")
                     return@doLast
@@ -1028,7 +1082,7 @@ fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider
     // LIST (one glob per line, WITH the Mach-O leading underscore) so ONLY the shim's boringssl_ffi_*
     // symbols leave the dylib — every BoringSSL symbol stays hidden (D3 one-unprefixed-copy). The list
     // is generated from the same curated surface as the GNU version-script (keyed on shimHash).
-    val ffiMarker = libDir.resolve(".ffi-$boringsslCommit-$shimHash")
+    val ffiMarker = libDir.resolve(".ffi-$boringsslCommit-p$patchSetHash-$shimHash")
     val linkFfi =
         tasks.register("linkBoringSslFfiApple$cap") {
             group = "boringssl"
@@ -1160,6 +1214,8 @@ fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider
                       "sha256": "$digest",
                       "boringsslCommit": "$boringsslCommit",
                       "boringsslApiVersion": $boringsslApiVersion,
+                      "patchSet": "$patchSetHash",
+                      "patches": [${patchSetNames.joinToString(", ") { "\"$it\"" }}],
                       "quicheAbi": "${catalog.findVersion("boringsslQuicheAbi").get().requiredVersion}",
                       "triple": "${t.id}",
                       "appleSdk": "${t.sdk}",
