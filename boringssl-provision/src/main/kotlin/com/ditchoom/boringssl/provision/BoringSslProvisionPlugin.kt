@@ -3,6 +3,7 @@ package com.ditchoom.boringssl.provision
 import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import java.io.File
 import java.net.URI
 import java.security.MessageDigest
@@ -91,6 +92,65 @@ open class BoringSslProvisionExtension(private val project: Project) {
         marker.writeText("$actual\n")
         project.logger.lifecycle("Provisioned BoringSSL $version/$triple → $dest")
         return dest
+    }
+
+    /**
+     * One-line K/N cinterop wiring over [boringsslDir] (RFC §4 / D8). Provisions the [triple]'s bundle,
+     * copies the canonical shipped `boringssl.def` (or a consumer [def] override), injects the resolved
+     * `libraryPaths` / `staticLibraries` + platform `linkerOpts`, and registers the cinterop on the
+     * target's `main` compilation — so a K/N consumer gets BoringSSL bindings with ~1 line and no
+     * hand-written `.def`:
+     *
+     * ```
+     * kotlin { val mac = macosArm64() }
+     * boringssl { cinterop(mac) }
+     * ```
+     *
+     * The generated cinterop is named [cinteropName] (default `boringssl`). [triple] defaults to the
+     * target name (the konan preset name — `linuxX64`, `macosArm64`, … — which matches the bundle
+     * triple); pass it explicitly only if the target was given a non-default name.
+     */
+    fun cinterop(
+        target: KotlinNativeTarget,
+        cinteropName: String = "boringssl",
+        triple: String = target.name,
+        def: File? = null,
+    ) {
+        val dir = boringsslDir(triple)
+        val includeDir = File(dir, "include")
+        val libDir = File(dir, "lib")
+
+        val baseDefText =
+            def?.readText()
+                ?: BoringSslProvisionExtension::class.java
+                    .getResourceAsStream("/com/ditchoom/boringssl/provision/boringssl.def")
+                    ?.use { it.readBytes().decodeToString() }
+                ?: throw GradleException("boringssl.cinterop: canonical boringssl.def resource missing from the plugin jar")
+
+        val sep = baseDefText.indexOf("\n---")
+        require(sep > 0) { "boringssl.cinterop: def is missing the '---' separator (def=${def?.absolutePath ?: "canonical"})" }
+
+        // glibc floors (K/N linuxX64/Arm64) keep pthread + dl in separate libs; Apple auto-links
+        // libSystem, so there is nothing to add there. Only inject if the base def declares no linkerOpts.
+        val linkerOpts = if (triple.startsWith("linux")) "-lpthread -ldl" else ""
+        val baseDeclaresLinker = Regex("(?m)^\\s*linkerOpts\\s*=").containsMatchIn(baseDefText.substring(0, sep))
+        val injected =
+            buildString {
+                append(baseDefText, 0, sep)
+                append("\nlibraryPaths = ").append(libDir.absolutePath)
+                append("\nstaticLibraries = libssl.a libcrypto.a")
+                if (linkerOpts.isNotEmpty() && !baseDeclaresLinker) append("\nlinkerOpts = ").append(linkerOpts)
+                append("\n")
+                append(baseDefText, sep, baseDefText.length)
+            }
+        val generatedDef =
+            File(project.layout.buildDirectory.get().asFile, "generated/cinterop/$cinteropName-$triple.def")
+                .apply { parentFile.mkdirs(); writeText(injected) }
+
+        val settings = target.compilations.getByName("main").cinterops.create(cinteropName)
+        settings.defFile(generatedDef)
+        settings.includeDirs(includeDir)
+        project.logger.info("boringssl.cinterop: wired '$cinteropName' for $triple → def=${generatedDef.absolutePath}")
     }
 
     /** Resolve the tarball (local dist or download) and its expected checksum. */

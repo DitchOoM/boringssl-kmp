@@ -39,6 +39,14 @@ repositories {
     gradlePluginPortal()
 }
 
+dependencies {
+    // The `boringssl.cinterop(target)` helper (RFC §4) types against KotlinNativeTarget. compileOnly:
+    // the Kotlin Gradle plugin is ALWAYS on the classpath of the consumer build that applies this
+    // plugin (it applies `kotlin("multiplatform")`), so it must not be bundled into or forced by the
+    // provision plugin's own runtime — only visible at compile time.
+    compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
+}
+
 // ── Baked-in checksums resource (no TOFU — RFC §8 directive #4) ───────────────────────────────────
 // bakeChecksums reads a SHA256SUMS file (the release job's aggregated tarball digests) and writes
 // `boringssl-provision.properties` into a generated resource dir packed into the plugin jar. The

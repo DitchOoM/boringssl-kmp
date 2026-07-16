@@ -125,6 +125,20 @@ jobs:
         if: ${{ matrix.kn }}
         run: ./gradlew :boringssl-testsuite:macosArm64Test --stacktrace
 
+      # ── One-line consumer resolve (RFC §4 / item 1): publish the provision plugin to mavenLocal and
+      #    run samples/cinterop-consumer — a STANDALONE external build that applies the plugin and gets
+      #    K/N BoringSSL via `boringssl.cinterop(macosArm64())` with NO hand-written .def. Proves the
+      #    published plugin surface end-to-end against the just-built macosArm64 tarball (runtime KAT).
+      - name: "Provision-plugin one-line cinterop consumer resolve (${{ matrix.triple }})"
+        if: ${{ matrix.kn }}
+        run: |
+          BUNDLE_VERSION="${{ inputs.bundle_version != '' && inputs.bundle_version || '0.0.1-dev' }}"
+          ./gradlew :boringssl-provision:publishToMavenLocal --stacktrace
+          ./gradlew -p samples/cinterop-consumer macosArm64Test \
+            -PboringsslPluginVersion=0.0.1-SNAPSHOT \
+            -PboringsslBundleVersion="$BUNDLE_VERSION" \
+            --stacktrace
+
       - name: Upload ${{ matrix.triple }} bundle
         uses: actions/upload-artifact@v4
         with:
