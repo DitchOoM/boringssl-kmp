@@ -22,6 +22,13 @@ public object BoringSsl {
     /** BoringSSL's `OPENSSL_VERSION_NUMBER`; non-zero once the native library is loaded and linked. */
     public fun versionNumber(): Long = Backends.instance.versionNumber()
 
+    /**
+     * The BoringSSL backend selected for this runtime — which content-addressed flavor loaded, its
+     * coordinate, whether it advertises DTLS 1.3, and the version number (RFC §12 D8). Forces backend
+     * resolution; throws [BoringSslUnavailable] if no flavor could be loaded (or the JDK is < 21).
+     */
+    public fun backendInfo(): BoringSslBackendInfo = Backends.backendInfo()
+
     /** Returns the 32-byte SHA-256 digest of [input], computed by BoringSSL. */
     public fun sha256(input: ByteArray): ByteArray = Backends.instance.sha256(input)
 
