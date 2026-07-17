@@ -42,24 +42,44 @@ val generatedDef = layout.buildDirectory.file("generated/cinterop/boringsslsmoke
 
 // Inject the resolved absolute libraryPaths + staticLibraries into the def config (before `---`), the
 // way socket generates its LinuxSockets def. Depends on the archive build so the .a exists first.
-val generateSmokeDef =
-    tasks.register("generateSmokeDef") {
-        dependsOn(buildArchiveTask)
-        inputs.file(baseDef)
-        outputs.file(generatedDef)
-        doLast {
-            val libDir = provisioned.resolve("lib")
-            val base = baseDef.asFile.readText()
-            val sep = base.indexOf("\n---")
-            require(sep > 0) { "boringsslsmoke.def missing the '---' separator" }
-            val injected =
-                base.substring(0, sep) +
-                    "\nlibraryPaths = ${libDir.absolutePath}" +
-                    "\nstaticLibraries = libssl.a libcrypto.a\n" +
-                    base.substring(sep)
-            generatedDef.get().asFile.apply { parentFile.mkdirs(); writeText(injected) }
+// [staticLibs] is the space-separated archive list the consumer would link — "libssl.a libcrypto.a"
+// for the full bundle, "libcrypto.a" alone for the cryptoOnly gate.
+fun registerGenerateSmokeDef(
+    name: String,
+    src: org.gradle.api.file.RegularFile,
+    out: Provider<org.gradle.api.file.RegularFile>,
+    staticLibs: String,
+) = tasks.register(name) {
+    dependsOn(buildArchiveTask)
+    inputs.file(src)
+    outputs.file(out)
+    doLast {
+        val libDir = provisioned.resolve("lib")
+        val base = src.asFile.readText()
+        val sep = base.indexOf("\n---")
+        require(sep > 0) { "${src.asFile.name} missing the '---' separator" }
+        val injected =
+            base.substring(0, sep) +
+                "\nlibraryPaths = ${libDir.absolutePath}" +
+                "\nstaticLibraries = $staticLibs\n" +
+                base.substring(sep)
+        out.get().asFile.apply {
+            parentFile.mkdirs()
+            writeText(injected)
         }
     }
+}
+
+val generateSmokeDef = registerGenerateSmokeDef("generateSmokeDef", baseDef, generatedDef, "libssl.a libcrypto.a")
+
+// ── crypto-only gate: the same archive, linked as libcrypto.a ALONE (no libssl.a) ──
+// The standing CI gate for the provision plugin's cryptoOnly cinterop (Profile 1). A distinct wrapper
+// symbol/package (see boringsslsmoke_cryptoonly.def) keeps this second cinterop from colliding with
+// the full-bundle boringsslsmoke bindings in the same linuxX64 compilation.
+val cryptoOnlyBaseDef = layout.projectDirectory.file("src/nativeInterop/cinterop/boringsslsmoke_cryptoonly.def")
+val cryptoOnlyGeneratedDef = layout.buildDirectory.file("generated/cinterop/boringsslsmoke_cryptoonly.def")
+val generateSmokeDefCryptoOnly =
+    registerGenerateSmokeDef("generateSmokeDefCryptoOnly", cryptoOnlyBaseDef, cryptoOnlyGeneratedDef, "libcrypto.a")
 
 // Skip the K/N native target on a linux-aarch64 host: Kotlin/Native has no linux-aarch64 HOST target,
 // so registering linuxX64 there throws at config time (same guard the convention plugin uses). The
@@ -77,12 +97,19 @@ if (knHostSupported) {
                 defFile(project.file("build/generated/cinterop/boringsslsmoke.def"))
                 includeDirs(provisioned.resolve("include"))
             }
+            compilations.getByName("main").cinterops.create("boringsslsmokeCryptoonly") {
+                defFile(project.file("build/generated/cinterop/boringsslsmoke_cryptoonly.def"))
+                includeDirs(provisioned.resolve("include"))
+            }
         }
     }
 
-    // The cinterop must see the generated def (and thus the built archive) first.
+    // Each cinterop must see its generated def (and thus the built archive) first.
     tasks.matching { it.name == "cinteropBoringsslsmokeLinuxX64" }.configureEach {
         dependsOn(generateSmokeDef)
+    }
+    tasks.matching { it.name == "cinteropBoringsslsmokeCryptoonlyLinuxX64" }.configureEach {
+        dependsOn(generateSmokeDefCryptoOnly)
     }
 }
 
@@ -113,7 +140,10 @@ if (isMacHost) {
                         "\nlibraryPaths = ${libDir.absolutePath}" +
                         "\nstaticLibraries = libssl.a libcrypto.a\n" +
                         base.substring(sep)
-                appleGeneratedDef.get().asFile.apply { parentFile.mkdirs(); writeText(injected) }
+                appleGeneratedDef.get().asFile.apply {
+                    parentFile.mkdirs()
+                    writeText(injected)
+                }
             }
         }
 
