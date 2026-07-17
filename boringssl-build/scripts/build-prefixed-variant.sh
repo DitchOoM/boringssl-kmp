@@ -81,7 +81,13 @@ grep -oE '^#define [A-Za-z_][A-Za-z0-9_]+ BORINGSSL_ADD_PREFIX' "$PREF_HDR" | aw
 # nm reflects the HOST object format (Mach-O symbols carry a leading underscore; ELF do not), so only the
 # adapter matching --format is generatable here — each platform's variant is built on its own host.
 nm -g --defined-only "$OUT/lib/libcrypto.a" "$OUT/lib/libssl.a" 2>/dev/null | awk 'NF>=3 && $2 ~ /^[A-Za-z]$/ {print $3}' | sort -u > "$WORK/defined_syms.txt"
-ADAPTER="$OUT/adapter/aliases.$FORMAT"
+# Adapter file names are the CONTRACT with the provision plugin's `cinterop(alias=…)` linkerOpts
+# (BoringSslProvisionPlugin): `aliases.macho` (ld64 -alias_list) / `aliases.elf.ld` (GNU ld script).
+case "$FORMAT" in
+  macho) ADAPTER="$OUT/adapter/aliases.macho" ;;
+  elf)   ADAPTER="$OUT/adapter/aliases.elf.ld" ;;
+  *)     echo "unknown --format: $FORMAT (want macho|elf)"; exit 2 ;;
+esac
 : > "$ADAPTER"
 while read -r NAME; do
   case "$FORMAT" in
@@ -92,6 +98,14 @@ done < "$WORK/header_names.txt"
 COUNT=$(wc -l < "$ADAPTER" | tr -d ' ')
 echo "      $FORMAT aliases: $COUNT"
 [ "$COUNT" -gt 0 ] || { echo "adapter is EMPTY — nm/format mismatch (building $FORMAT on the wrong host?)"; exit 1; }
+# The spike's asm-coverage tripwire (spikes/d8-alias-shim/run.sh step 5): prefixing must reach
+# asm-defined symbols too, and the adapter must alias them — their absence means a partially-prefixed
+# variant whose plain asm globals would collide with the canonical copy under --whole-archive.
+asm_in_table=0
+for s in sha256_block_data_order ChaCha20_ctr32; do
+  grep -qE "(_|[= ])${s}\b" "$ADAPTER" && { echo "      asm symbol present: $s"; asm_in_table=1; }
+done
+[ "$asm_in_table" = 1 ] || { echo "no asm symbols in the alias adapter — partially-prefixed variant?"; exit 1; }
 
 echo "[5/5] staged variant → $OUT (lib/ include/ adapter/)"
 rm -rf "$WORK"   # drop the ~large intermediate cmake trees; keep only the staged artifacts
