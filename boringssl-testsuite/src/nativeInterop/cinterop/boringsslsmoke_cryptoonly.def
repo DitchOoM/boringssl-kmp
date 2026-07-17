@@ -1,5 +1,5 @@
 package = com.ditchoom.boringssl.smoke.cryptoonly
-headers = openssl/sha.h openssl/curve25519.h openssl/hkdf.h openssl/digest.h
+headers = openssl/sha.h openssl/curve25519.h openssl/hkdf.h openssl/digest.h openssl/hmac.h openssl/aead.h openssl/ec.h openssl/ec_key.h openssl/ecdsa.h openssl/nid.h openssl/bn.h openssl/rand.h
 # glibc 2.19 (K/N linuxX64 floor) keeps pthread + dl in separate libs.
 linkerOpts = -lpthread -ldl
 
@@ -13,7 +13,16 @@ linkerOpts = -lpthread -ldl
 #include <openssl/curve25519.h>
 #include <openssl/hkdf.h>
 #include <openssl/digest.h>
+#include <openssl/hmac.h>
+#include <openssl/aead.h>
+#include <openssl/ec.h>
+#include <openssl/ec_key.h>
+#include <openssl/ecdsa.h>
+#include <openssl/nid.h>
+#include <openssl/bn.h>
+#include <openssl/rand.h>
 #include <stddef.h>
+#include <string.h>
 
 // Crypto-only closure probe. Exercises a representative slice of buffer's frozen crypto subset —
 // SHA256 + X25519 (curve25519) + HKDF — through ONE callable symbol, linked against libcrypto.a ALONE
@@ -41,4 +50,482 @@ static inline int bssl_smoke_crypto_probe(const unsigned char *data, size_t len,
              secret, sizeof(secret), salt, sizeof(salt), info, sizeof(info)) != 1) return 0;
 
     return 1;
+}
+
+// ── Surface-contract KAT batteries (Profile 1: buffer's frozen crypto closure) ──────────────────
+// Deterministic RFC/NIST known-answer probes over the algorithm families buffer's ~75-symbol
+// libcrypto closure consumes — HMAC, EVP_AEAD (AES-GCM + ChaCha20-Poly1305), Ed25519, X25519,
+// ECDSA/ECDH P-256 (shared secrets via EC_POINT_mul, matching buffer's shape), SHA-384/512, RAND —
+// every one linked against libcrypto.a ALONE. Vectors live here as byte arrays (never long hex
+// string literals: the single-pin grep-gate hunts 40-hex strings). Each probe returns 0 on success
+// or a distinct nonzero code naming the failing step, so a red run points at the exact broken
+// operation. The only non-byte-deterministic assertions are the sanctioned ones: sign/agree
+// ROUNDTRIPS over freshly generated keys (outcome-deterministic) and RAND_bytes filling nonzero.
+
+// RFC 4231 test case 1: HMAC-SHA-256, key = 20×0x0b, data = "Hi There".
+static inline int bssl_kat_hmac_sha256(void) {
+    static const unsigned char key[20] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b,
+    };
+    static const unsigned char msg[8] = {
+        0x48, 0x69, 0x20, 0x54, 0x68, 0x65, 0x72, 0x65,  // "Hi There"
+    };
+    static const unsigned char want[32] = {
+        0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53,
+        0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b, 0xf1, 0x2b,
+        0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7,
+        0x26, 0xe9, 0x37, 0x6c, 0x2e, 0x32, 0xcf, 0xf7,
+    };
+    unsigned char out[32];
+    unsigned int out_len = 0;
+    if (HMAC(EVP_sha256(), key, sizeof(key), msg, sizeof(msg), out, &out_len) == NULL) return 1;
+    if (out_len != sizeof(want)) return 2;
+    if (memcmp(out, want, sizeof(want)) != 0) return 3;
+    return 0;
+}
+
+// RFC 4231 test case 1: HMAC-SHA-512, key = 20×0x0b, data = "Hi There".
+static inline int bssl_kat_hmac_sha512(void) {
+    static const unsigned char key[20] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b,
+    };
+    static const unsigned char msg[8] = {
+        0x48, 0x69, 0x20, 0x54, 0x68, 0x65, 0x72, 0x65,  // "Hi There"
+    };
+    static const unsigned char want[64] = {
+        0x87, 0xaa, 0x7c, 0xde, 0xa5, 0xef, 0x61, 0x9d,
+        0x4f, 0xf0, 0xb4, 0x24, 0x1a, 0x1d, 0x6c, 0xb0,
+        0x23, 0x79, 0xf4, 0xe2, 0xce, 0x4e, 0xc2, 0x78,
+        0x7a, 0xd0, 0xb3, 0x05, 0x45, 0xe1, 0x7c, 0xde,
+        0xda, 0xa8, 0x33, 0xb7, 0xd6, 0xb8, 0xa7, 0x02,
+        0x03, 0x8b, 0x27, 0x4e, 0xae, 0xa3, 0xf4, 0xe4,
+        0xbe, 0x9d, 0x91, 0x4e, 0xeb, 0x61, 0xf1, 0x70,
+        0x2e, 0x69, 0x6c, 0x20, 0x3a, 0x12, 0x68, 0x54,
+    };
+    unsigned char out[64];
+    unsigned int out_len = 0;
+    if (HMAC(EVP_sha512(), key, sizeof(key), msg, sizeof(msg), out, &out_len) == NULL) return 1;
+    if (out_len != sizeof(want)) return 2;
+    if (memcmp(out, want, sizeof(want)) != 0) return 3;
+    return 0;
+}
+
+// Shared EVP_AEAD KAT shape: seal must reproduce ct||tag EXACTLY, open must roundtrip the
+// plaintext, and a tampered first byte must fail to open. Codes: 1 ctx, 2 seal, 3 seal length,
+// 4 ct||tag mismatch, 5 open, 6 roundtrip mismatch, 7 tampered input opened.
+static inline int bssl_kat_aead_seal_open(const EVP_AEAD *aead,
+                                          const unsigned char *key, size_t key_len,
+                                          const unsigned char *nonce, size_t nonce_len,
+                                          const unsigned char *ad, size_t ad_len,
+                                          const unsigned char *pt, size_t pt_len,
+                                          const unsigned char *want_ct_tag, size_t want_len) {
+    EVP_AEAD_CTX *ctx = EVP_AEAD_CTX_new(aead, key, key_len, EVP_AEAD_DEFAULT_TAG_LENGTH);
+    if (ctx == NULL) return 1;
+    unsigned char sealed[256];
+    size_t sealed_len = 0;
+    if (EVP_AEAD_CTX_seal(ctx, sealed, &sealed_len, sizeof(sealed),
+                          nonce, nonce_len, pt, pt_len, ad, ad_len) != 1) {
+        EVP_AEAD_CTX_free(ctx);
+        return 2;
+    }
+    if (sealed_len != want_len) {
+        EVP_AEAD_CTX_free(ctx);
+        return 3;
+    }
+    if (memcmp(sealed, want_ct_tag, want_len) != 0) {
+        EVP_AEAD_CTX_free(ctx);
+        return 4;
+    }
+    unsigned char opened[256];
+    size_t opened_len = 0;
+    if (EVP_AEAD_CTX_open(ctx, opened, &opened_len, sizeof(opened),
+                          nonce, nonce_len, sealed, sealed_len, ad, ad_len) != 1) {
+        EVP_AEAD_CTX_free(ctx);
+        return 5;
+    }
+    if (opened_len != pt_len || (pt_len != 0 && memcmp(opened, pt, pt_len) != 0)) {
+        EVP_AEAD_CTX_free(ctx);
+        return 6;
+    }
+    sealed[0] ^= 0x01;  // corrupt one byte — authenticated open MUST reject
+    if (EVP_AEAD_CTX_open(ctx, opened, &opened_len, sizeof(opened),
+                          nonce, nonce_len, sealed, sealed_len, ad, ad_len) == 1) {
+        EVP_AEAD_CTX_free(ctx);
+        return 7;
+    }
+    EVP_AEAD_CTX_free(ctx);
+    return 0;
+}
+
+// NIST GCM spec (McGrew–Viega) test case 2: AES-128-GCM, zero key/IV, one zero block.
+static inline int bssl_kat_aes_128_gcm(void) {
+    static const unsigned char key[16] = {0};
+    static const unsigned char nonce[12] = {0};
+    static const unsigned char pt[16] = {0};
+    static const unsigned char want[32] = {
+        // ciphertext
+        0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
+        0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78,
+        // tag
+        0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd,
+        0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57, 0xbd, 0xdf,
+    };
+    return bssl_kat_aead_seal_open(EVP_aead_aes_128_gcm(), key, sizeof(key),
+                                   nonce, sizeof(nonce), NULL, 0,
+                                   pt, sizeof(pt), want, sizeof(want));
+}
+
+// NIST GCM spec (McGrew–Viega) test case 14: AES-256-GCM, zero key/IV, one zero block.
+static inline int bssl_kat_aes_256_gcm(void) {
+    static const unsigned char key[32] = {0};
+    static const unsigned char nonce[12] = {0};
+    static const unsigned char pt[16] = {0};
+    static const unsigned char want[32] = {
+        // ciphertext
+        0xce, 0xa7, 0x40, 0x3d, 0x4d, 0x60, 0x6b, 0x6e,
+        0x07, 0x4e, 0xc5, 0xd3, 0xba, 0xf3, 0x9d, 0x18,
+        // tag
+        0xd0, 0xd1, 0xc8, 0xa7, 0x99, 0x99, 0x6b, 0xf0,
+        0x26, 0x5b, 0x98, 0xb5, 0xd4, 0x8a, 0xb9, 0x19,
+    };
+    return bssl_kat_aead_seal_open(EVP_aead_aes_256_gcm(), key, sizeof(key),
+                                   nonce, sizeof(nonce), NULL, 0,
+                                   pt, sizeof(pt), want, sizeof(want));
+}
+
+// RFC 8439 §2.8.2: ChaCha20-Poly1305 AEAD, the "sunscreen" vector (114-byte plaintext + AAD).
+static inline int bssl_kat_chacha20_poly1305(void) {
+    static const unsigned char key[32] = {
+        0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+        0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+        0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+        0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f,
+    };
+    static const unsigned char nonce[12] = {
+        0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43,
+        0x44, 0x45, 0x46, 0x47,
+    };
+    static const unsigned char ad[12] = {
+        0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3,
+        0xc4, 0xc5, 0xc6, 0xc7,
+    };
+    static const unsigned char pt[] =
+        "Ladies and Gentlemen of the class of '99: "
+        "If I could offer you only one tip for the future, sunscreen would be it.";
+    static const unsigned char want[130] = {
+        // ciphertext (114 bytes)
+        0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb,
+        0x7b, 0x86, 0xaf, 0xbc, 0x53, 0xef, 0x7e, 0xc2,
+        0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe,
+        0xa9, 0xe2, 0xb5, 0xa7, 0x36, 0xee, 0x62, 0xd6,
+        0x3d, 0xbe, 0xa4, 0x5e, 0x8c, 0xa9, 0x67, 0x12,
+        0x82, 0xfa, 0xfb, 0x69, 0xda, 0x92, 0x72, 0x8b,
+        0x1a, 0x71, 0xde, 0x0a, 0x9e, 0x06, 0x0b, 0x29,
+        0x05, 0xd6, 0xa5, 0xb6, 0x7e, 0xcd, 0x3b, 0x36,
+        0x92, 0xdd, 0xbd, 0x7f, 0x2d, 0x77, 0x8b, 0x8c,
+        0x98, 0x03, 0xae, 0xe3, 0x28, 0x09, 0x1b, 0x58,
+        0xfa, 0xb3, 0x24, 0xe4, 0xfa, 0xd6, 0x75, 0x94,
+        0x55, 0x85, 0x80, 0x8b, 0x48, 0x31, 0xd7, 0xbc,
+        0x3f, 0xf4, 0xde, 0xf0, 0x8e, 0x4b, 0x7a, 0x9d,
+        0xe5, 0x76, 0xd2, 0x65, 0x86, 0xce, 0xc6, 0x4b,
+        0x61, 0x16,
+        // tag
+        0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a,
+        0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06, 0x91,
+    };
+    return bssl_kat_aead_seal_open(EVP_aead_chacha20_poly1305(), key, sizeof(key),
+                                   nonce, sizeof(nonce), ad, sizeof(ad),
+                                   pt, sizeof(pt) - 1, want, sizeof(want));
+}
+
+// RFC 8032 §7.1 TEST 1: Ed25519, empty message. Signing is deterministic, so the SIGNATURE bytes
+// are asserted exactly; a tampered signature must fail to verify.
+static inline int bssl_kat_ed25519(void) {
+    static const unsigned char seed[32] = {
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
+        0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
+        0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19,
+        0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
+    };
+    static const unsigned char want_pub[32] = {
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+    };
+    static const unsigned char want_sig[64] = {
+        0xe5, 0x56, 0x43, 0x00, 0xc3, 0x60, 0xac, 0x72,
+        0x90, 0x86, 0xe2, 0xcc, 0x80, 0x6e, 0x82, 0x8a,
+        0x84, 0x87, 0x7f, 0x1e, 0xb8, 0xe5, 0xd9, 0x74,
+        0xd8, 0x73, 0xe0, 0x65, 0x22, 0x49, 0x01, 0x55,
+        0x5f, 0xb8, 0x82, 0x15, 0x90, 0xa3, 0x3b, 0xac,
+        0xc6, 0x1e, 0x39, 0x70, 0x1c, 0xf9, 0xb4, 0x6b,
+        0xd2, 0x5b, 0xf5, 0xf0, 0x59, 0x5b, 0xbe, 0x24,
+        0x65, 0x51, 0x41, 0x43, 0x8e, 0x7a, 0x10, 0x0b,
+    };
+    unsigned char pub[32];
+    unsigned char priv[64];
+    unsigned char sig[64];
+    ED25519_keypair_from_seed(pub, priv, seed);
+    if (memcmp(pub, want_pub, sizeof(want_pub)) != 0) return 1;
+    if (ED25519_sign(sig, (const unsigned char *)"", 0, priv) != 1) return 2;
+    if (memcmp(sig, want_sig, sizeof(want_sig)) != 0) return 3;
+    if (ED25519_verify((const unsigned char *)"", 0, sig, pub) != 1) return 4;
+    sig[0] ^= 0x01;  // corrupt — verify MUST reject
+    if (ED25519_verify((const unsigned char *)"", 0, sig, pub) == 1) return 5;
+    return 0;
+}
+
+// RFC 7748 §5.2 vector 1: X25519 scalar × point must match the known output exactly; then a
+// keypair-based two-party agreement roundtrip (randomized keys — assert equality, never bytes).
+static inline int bssl_kat_x25519(void) {
+    static const unsigned char scalar[32] = {
+        0xa5, 0x46, 0xe3, 0x6b, 0xf0, 0x52, 0x7c, 0x9d,
+        0x3b, 0x16, 0x15, 0x4b, 0x82, 0x46, 0x5e, 0xdd,
+        0x62, 0x14, 0x4c, 0x0a, 0xc1, 0xfc, 0x5a, 0x18,
+        0x50, 0x6a, 0x22, 0x44, 0xba, 0x44, 0x9a, 0xc4,
+    };
+    static const unsigned char point[32] = {
+        0xe6, 0xdb, 0x68, 0x67, 0x58, 0x30, 0x30, 0xdb,
+        0x35, 0x94, 0xc1, 0xa4, 0x24, 0xb1, 0x5f, 0x7c,
+        0x72, 0x66, 0x24, 0xec, 0x26, 0xb3, 0x35, 0x3b,
+        0x10, 0xa9, 0x03, 0xa6, 0xd0, 0xab, 0x1c, 0x4c,
+    };
+    static const unsigned char want[32] = {
+        0xc3, 0xda, 0x55, 0x37, 0x9d, 0xe9, 0xc6, 0x90,
+        0x8e, 0x94, 0xea, 0x4d, 0xf2, 0x8d, 0x08, 0x4f,
+        0x32, 0xec, 0xcf, 0x03, 0x49, 0x1c, 0x71, 0xf7,
+        0x54, 0xb4, 0x07, 0x55, 0x77, 0xa2, 0x85, 0x52,
+    };
+    unsigned char out[32];
+    if (X25519(out, scalar, point) != 1) return 1;
+    if (memcmp(out, want, sizeof(want)) != 0) return 2;
+    unsigned char a_priv[32];
+    unsigned char a_pub[32];
+    unsigned char b_priv[32];
+    unsigned char b_pub[32];
+    unsigned char shared_a[32];
+    unsigned char shared_b[32];
+    X25519_keypair(a_pub, a_priv);
+    X25519_keypair(b_pub, b_priv);
+    if (X25519(shared_a, a_priv, b_pub) != 1) return 3;
+    if (X25519(shared_b, b_priv, a_pub) != 1) return 4;
+    if (memcmp(shared_a, shared_b, sizeof(shared_a)) != 0) return 5;
+    return 0;
+}
+
+// ECDSA P-256 / SHA-256. Verify path is a fixed KNOWN-GOOD vector (RFC 6979 §A.2.5, message
+// "sample": the deterministic-nonce r||s verifies under standard ECDSA); a tampered digest must
+// reject. Sign path is RANDOMIZED in BoringSSL, so it is only round-tripped — signature bytes are
+// deliberately NEVER asserted.
+static inline int bssl_kat_ecdsa_p256(void) {
+    static const unsigned char qx[32] = {
+        0x60, 0xfe, 0xd4, 0xba, 0x25, 0x5a, 0x9d, 0x31,
+        0xc9, 0x61, 0xeb, 0x74, 0xc6, 0x35, 0x6d, 0x68,
+        0xc0, 0x49, 0xb8, 0x92, 0x3b, 0x61, 0xfa, 0x6c,
+        0xe6, 0x69, 0x62, 0x2e, 0x60, 0xf2, 0x9f, 0xb6,
+    };
+    static const unsigned char qy[32] = {
+        0x79, 0x03, 0xfe, 0x10, 0x08, 0xb8, 0xbc, 0x99,
+        0xa4, 0x1a, 0xe9, 0xe9, 0x56, 0x28, 0xbc, 0x64,
+        0xf2, 0xf1, 0xb2, 0x0c, 0x2d, 0x7e, 0x9f, 0x51,
+        0x77, 0xa3, 0xc2, 0x94, 0xd4, 0x46, 0x22, 0x99,
+    };
+    static const unsigned char r_bytes[32] = {
+        0xef, 0xd4, 0x8b, 0x2a, 0xac, 0xb6, 0xa8, 0xfd,
+        0x11, 0x40, 0xdd, 0x9c, 0xd4, 0x5e, 0x81, 0xd6,
+        0x9d, 0x2c, 0x87, 0x7b, 0x56, 0xaa, 0xf9, 0x91,
+        0xc3, 0x4d, 0x0e, 0xa8, 0x4e, 0xaf, 0x37, 0x16,
+    };
+    static const unsigned char s_bytes[32] = {
+        0xf7, 0xcb, 0x1c, 0x94, 0x2d, 0x65, 0x7c, 0x41,
+        0xd4, 0x36, 0xc7, 0xa1, 0xb6, 0xe2, 0x9f, 0x65,
+        0xf3, 0xe9, 0x00, 0xdb, 0xb9, 0xaf, 0xf4, 0x06,
+        0x4d, 0xc4, 0xab, 0x2f, 0x84, 0x3a, 0xcd, 0xa8,
+    };
+    static const unsigned char msg[6] = {0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65};  // "sample"
+    int rc = 0;
+    EC_GROUP *group = NULL;
+    EC_KEY *key = NULL;
+    EC_POINT *pub = NULL;
+    ECDSA_SIG *sig = NULL;
+    ECDSA_SIG *sig2 = NULL;
+    EC_KEY *key2 = NULL;
+    unsigned char pub_oct[65];
+    unsigned char digest[32];
+    group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (group == NULL) { rc = 1; goto out; }
+    key = EC_KEY_new();
+    if (key == NULL || EC_KEY_set_group(key, group) != 1) { rc = 2; goto out; }
+    pub = EC_POINT_new(group);
+    pub_oct[0] = 0x04;  // uncompressed point: 0x04 || X || Y
+    memcpy(pub_oct + 1, qx, sizeof(qx));
+    memcpy(pub_oct + 33, qy, sizeof(qy));
+    if (pub == NULL || EC_POINT_oct2point(group, pub, pub_oct, sizeof(pub_oct), NULL) != 1) {
+        rc = 3; goto out;
+    }
+    if (EC_KEY_set_public_key(key, pub) != 1) { rc = 4; goto out; }
+    SHA256(msg, sizeof(msg), digest);
+    sig = ECDSA_SIG_new();
+    if (sig == NULL) { rc = 5; goto out; }
+    {
+        BIGNUM *r = BN_bin2bn(r_bytes, sizeof(r_bytes), NULL);
+        BIGNUM *s = BN_bin2bn(s_bytes, sizeof(s_bytes), NULL);
+        if (r == NULL || s == NULL || ECDSA_SIG_set0(sig, r, s) != 1) {
+            BN_free(r);
+            BN_free(s);
+            rc = 6;
+            goto out;
+        }
+    }
+    if (ECDSA_do_verify(digest, sizeof(digest), sig, key) != 1) { rc = 7; goto out; }
+    digest[0] ^= 0x01;  // corrupt — verify MUST reject
+    if (ECDSA_do_verify(digest, sizeof(digest), sig, key) == 1) { rc = 8; goto out; }
+    digest[0] ^= 0x01;  // restore
+    key2 = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (key2 == NULL || EC_KEY_generate_key(key2) != 1) { rc = 9; goto out; }
+    sig2 = ECDSA_do_sign(digest, sizeof(digest), key2);  // randomized — bytes never asserted
+    if (sig2 == NULL) { rc = 10; goto out; }
+    if (ECDSA_do_verify(digest, sizeof(digest), sig2, key2) != 1) { rc = 11; goto out; }
+out:
+    ECDSA_SIG_free(sig2);
+    ECDSA_SIG_free(sig);
+    EC_KEY_free(key2);
+    EC_KEY_free(key);
+    EC_POINT_free(pub);
+    EC_GROUP_free(group);
+    return rc;
+}
+
+// ECDH P-256 via EC_POINT_mul — buffer's exact shared-secret shape (it never calls
+// ECDH_compute_key). Fixed-vector leg: d×G must land on the RFC 6979 §A.2.5 public key (checked
+// through EC_POINT_get_affine_coordinates_GFp + BN_bn2bin_padded, both in buffer's closure). Then
+// a two-party agreement roundtrip over generated keys (randomized — assert equality, never bytes).
+static inline int bssl_kat_ecdh_p256(void) {
+    static const unsigned char d_bytes[32] = {
+        0xc9, 0xaf, 0xa9, 0xd8, 0x45, 0xba, 0x75, 0x16,
+        0x6b, 0x5c, 0x21, 0x57, 0x67, 0xb1, 0xd6, 0x93,
+        0x4e, 0x50, 0xc3, 0xdb, 0x36, 0xe8, 0x9b, 0x12,
+        0x7b, 0x8a, 0x62, 0x2b, 0x12, 0x0f, 0x67, 0x21,
+    };
+    static const unsigned char qx[32] = {
+        0x60, 0xfe, 0xd4, 0xba, 0x25, 0x5a, 0x9d, 0x31,
+        0xc9, 0x61, 0xeb, 0x74, 0xc6, 0x35, 0x6d, 0x68,
+        0xc0, 0x49, 0xb8, 0x92, 0x3b, 0x61, 0xfa, 0x6c,
+        0xe6, 0x69, 0x62, 0x2e, 0x60, 0xf2, 0x9f, 0xb6,
+    };
+    static const unsigned char qy[32] = {
+        0x79, 0x03, 0xfe, 0x10, 0x08, 0xb8, 0xbc, 0x99,
+        0xa4, 0x1a, 0xe9, 0xe9, 0x56, 0x28, 0xbc, 0x64,
+        0xf2, 0xf1, 0xb2, 0x0c, 0x2d, 0x7e, 0x9f, 0x51,
+        0x77, 0xa3, 0xc2, 0x94, 0xd4, 0x46, 0x22, 0x99,
+    };
+    int rc = 0;
+    EC_GROUP *group = NULL;
+    BN_CTX *ctx = NULL;
+    BIGNUM *d = NULL;
+    EC_POINT *pub = NULL;
+    BIGNUM *x = NULL;
+    BIGNUM *y = NULL;
+    EC_KEY *ka = NULL;
+    EC_KEY *kb = NULL;
+    EC_POINT *s1 = NULL;
+    EC_POINT *s2 = NULL;
+    unsigned char got_x[32];
+    unsigned char got_y[32];
+    unsigned char sx1[32];
+    unsigned char sx2[32];
+    group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    ctx = BN_CTX_new();
+    d = BN_bin2bn(d_bytes, sizeof(d_bytes), NULL);
+    pub = (group != NULL) ? EC_POINT_new(group) : NULL;
+    x = BN_new();
+    y = BN_new();
+    if (group == NULL || ctx == NULL || d == NULL || pub == NULL || x == NULL || y == NULL) {
+        rc = 1; goto out;
+    }
+    if (EC_POINT_mul(group, pub, d, NULL, NULL, ctx) != 1) { rc = 2; goto out; }
+    if (EC_POINT_get_affine_coordinates_GFp(group, pub, x, y, ctx) != 1) { rc = 3; goto out; }
+    if (BN_bn2bin_padded(got_x, sizeof(got_x), x) != 1 ||
+        BN_bn2bin_padded(got_y, sizeof(got_y), y) != 1) { rc = 4; goto out; }
+    if (memcmp(got_x, qx, sizeof(qx)) != 0 || memcmp(got_y, qy, sizeof(qy)) != 0) {
+        rc = 5; goto out;
+    }
+    ka = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    kb = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    if (ka == NULL || kb == NULL ||
+        EC_KEY_generate_key(ka) != 1 || EC_KEY_generate_key(kb) != 1) { rc = 6; goto out; }
+    s1 = EC_POINT_new(group);
+    s2 = EC_POINT_new(group);
+    if (s1 == NULL || s2 == NULL) { rc = 7; goto out; }
+    if (EC_POINT_mul(group, s1, NULL,
+                     EC_KEY_get0_public_key(kb), EC_KEY_get0_private_key(ka), ctx) != 1) {
+        rc = 8; goto out;
+    }
+    if (EC_POINT_mul(group, s2, NULL,
+                     EC_KEY_get0_public_key(ka), EC_KEY_get0_private_key(kb), ctx) != 1) {
+        rc = 9; goto out;
+    }
+    if (EC_POINT_get_affine_coordinates_GFp(group, s1, x, y, ctx) != 1 ||
+        BN_bn2bin_padded(sx1, sizeof(sx1), x) != 1) { rc = 10; goto out; }
+    if (EC_POINT_get_affine_coordinates_GFp(group, s2, x, y, ctx) != 1 ||
+        BN_bn2bin_padded(sx2, sizeof(sx2), x) != 1) { rc = 11; goto out; }
+    if (memcmp(sx1, sx2, sizeof(sx1)) != 0) { rc = 12; goto out; }
+out:
+    EC_POINT_free(s2);
+    EC_POINT_free(s1);
+    EC_KEY_free(kb);
+    EC_KEY_free(ka);
+    BN_free(y);
+    BN_free(x);
+    BN_free(d);
+    EC_POINT_free(pub);
+    BN_CTX_free(ctx);
+    EC_GROUP_free(group);
+    return rc;
+}
+
+// RFC 6234 / FIPS 180-4 "abc" vectors for SHA-384 and SHA-512 (SHA-256's lives in the link-smokes).
+static inline int bssl_kat_sha384_sha512(void) {
+    static const unsigned char msg[3] = {0x61, 0x62, 0x63};  // "abc"
+    static const unsigned char want384[48] = {
+        0xcb, 0x00, 0x75, 0x3f, 0x45, 0xa3, 0x5e, 0x8b,
+        0xb5, 0xa0, 0x3d, 0x69, 0x9a, 0xc6, 0x50, 0x07,
+        0x27, 0x2c, 0x32, 0xab, 0x0e, 0xde, 0xd1, 0x63,
+        0x1a, 0x8b, 0x60, 0x5a, 0x43, 0xff, 0x5b, 0xed,
+        0x80, 0x86, 0x07, 0x2b, 0xa1, 0xe7, 0xcc, 0x23,
+        0x58, 0xba, 0xec, 0xa1, 0x34, 0xc8, 0x25, 0xa7,
+    };
+    static const unsigned char want512[64] = {
+        0xdd, 0xaf, 0x35, 0xa1, 0x93, 0x61, 0x7a, 0xba,
+        0xcc, 0x41, 0x73, 0x49, 0xae, 0x20, 0x41, 0x31,
+        0x12, 0xe6, 0xfa, 0x4e, 0x89, 0xa9, 0x7e, 0xa2,
+        0x0a, 0x9e, 0xee, 0xe6, 0x4b, 0x55, 0xd3, 0x9a,
+        0x21, 0x92, 0x99, 0x2a, 0x27, 0x4f, 0xc1, 0xa8,
+        0x36, 0xba, 0x3c, 0x23, 0xa3, 0xfe, 0xeb, 0xbd,
+        0x45, 0x4d, 0x44, 0x23, 0x64, 0x3c, 0xe8, 0x0e,
+        0x2a, 0x9a, 0xc9, 0x4f, 0xa5, 0x4c, 0xa4, 0x9f,
+    };
+    unsigned char out384[48];
+    unsigned char out512[64];
+    SHA384(msg, sizeof(msg), out384);
+    SHA512(msg, sizeof(msg), out512);
+    if (memcmp(out384, want384, sizeof(want384)) != 0) return 1;
+    if (memcmp(out512, want512, sizeof(want512)) != 0) return 2;
+    return 0;
+}
+
+// RAND_bytes must report success and actually fill the buffer (all-zero output would signal a
+// broken entropy path; a 32-byte draw is all-zero with probability 2^-256 — never in practice).
+static inline int bssl_kat_rand_bytes(void) {
+    unsigned char buf[32] = {0};
+    if (RAND_bytes(buf, sizeof(buf)) != 1) return 1;
+    int nonzero = 0;
+    for (size_t i = 0; i < sizeof(buf); i++) nonzero |= buf[i];
+    if (nonzero == 0) return 2;
+    return 0;
 }
