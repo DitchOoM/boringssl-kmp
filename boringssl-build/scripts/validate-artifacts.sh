@@ -19,6 +19,7 @@
 #   5. the .so exports EXACTLY the curated boringssl_ffi_* surface and NOTHING else — every BoringSSL
 #      symbol is hidden                                                (D3 single-copy tripwire)
 #   6. records the .so size (Android per-ABI budget is enforced on the static subset in step 7)
+#   7. every symbol in contracts/*.txt is DEFINED in libcrypto.a       (consumer symbol contracts)
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -104,5 +105,43 @@ ok "libboringsslffi.so exports only boringssl_ffi_* ($(wc -l <<<"$exported") sym
 # ── 6. size record ───────────────────────────────────────────────────────────────────────────────
 so_bytes="$(stat -c%s "$SO" 2>/dev/null || stat -f%z "$SO")"
 echo "  · libboringsslffi.so size: $so_bytes bytes ($(( so_bytes / 1024 )) KiB)"
+
+# ── 7. consumer symbol contracts — every closure symbol stays DEFINED across pin moves ───────────
+# Each contracts/*.txt is a committed allowlist of raw libcrypto functions a downstream consumer's
+# cinterop wrapper closure links against (see each file's header for provenance). Every entry must
+# be DEFINED (T or W, optional leading underscore — the same tolerance as check 4) in the extracted
+# libcrypto.a, so a canonical-pin move can never silently drop a symbol a consumer calls. Reuses
+# the check-4 `crypto_syms` capture (see the SIGPIPE note there). Misses are collected across ALL
+# contract files, printed together, and failed once.
+CONTRACTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/contracts"
+contract_files=("$CONTRACTS_DIR"/*.txt)
+[ "${#contract_files[@]}" -ge 1 ] || fail "no symbol contracts found in $CONTRACTS_DIR"
+# Normalize the capture ONCE into bare DEFINED (T/W) symbol names, leading underscore stripped (the
+# same tolerance as check 4) — so each contract entry is matched EXACTLY (`grep -qxF`), never
+# interpolated into a regex where a stray metachar ('.', '+') would silently widen the match.
+defined_syms="$(awk '($2=="T"||$2=="W"){sub(/^_/,"",$3); print $3}' <<<"$crypto_syms" | sort -u)"
+missing=""
+for contract in "${contract_files[@]}"; do
+  checked=0
+  file_missing=0
+  # `|| [ -n "$sym" ]` keeps a final line without a trailing newline from being silently dropped.
+  while IFS= read -r sym || [ -n "$sym" ]; do
+    sym="${sym%%#*}"              # strip comments
+    sym="${sym//[[:space:]]/}"    # strip whitespace
+    [ -n "$sym" ] || continue
+    checked=$(( checked + 1 ))
+    if ! grep -qxF "$sym" <<<"$defined_syms"; then
+      missing+="  $(basename "$contract"): $sym"$'\n'
+      file_missing=$(( file_missing + 1 ))
+    fi
+  done <"$contract"
+  [ "$checked" -ge 1 ] || fail "$(basename "$contract") contains no symbols — empty contract"
+  if [ "$file_missing" -eq 0 ]; then
+    ok "$(basename "$contract"): all $checked closure symbols defined in libcrypto.a"
+  fi
+done
+if [ -n "$missing" ]; then
+  fail "symbol contract violated — consumer-closure symbols NOT defined in libcrypto.a:"$'\n'"$missing"
+fi
 
 echo "== validate-artifacts: $TRIPLE OK =="
