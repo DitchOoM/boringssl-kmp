@@ -51,9 +51,16 @@ data class NativeTriple(
 
 val linuxTriples =
     listOf(
+        // Lean flags (-ffunction-sections/-fdata-sections): put each function/datum in its own section
+        // so a consumer's `--gc-sections` at final link drops everything it doesn't reference — e.g.
+        // buffer-crypto (libcrypto-only, no TLS) pulls just its SHA/AEAD/curve25519/HKDF/EC closure.
+        // Link-transparent (symbol semantics unchanged), so quiche's whole-archive external link (§6) is
+        // unaffected. NOT -fvisibility=hidden here: that only helps .so consumers (JVM/Android, which use
+        // their own build) and would perturb the SHARED canonical tarball socket/quiche link against.
         NativeTriple(
             "linuxX64", dockerArch = "amd64", dockerPlatform = "linux/amd64",
-            crossCc = null, crossCxx = null, crossSystemProcessor = null, extraCFlags = listOf("-fPIC"),
+            crossCc = null, crossCxx = null, crossSystemProcessor = null,
+            extraCFlags = listOf("-fPIC", "-ffunction-sections", "-fdata-sections"),
         ),
         // arm64: native aarch64 in the container (qemu). -mno-outline-atomics avoids emitting
         // __aarch64_cas*/__aarch64_ldadd* helper refs the K/N linker can't resolve (socket's fix).
@@ -62,7 +69,7 @@ val linuxTriples =
             crossCc = "aarch64-linux-gnu-gcc",
             crossCxx = "aarch64-linux-gnu-g++",
             crossSystemProcessor = "aarch64",
-            extraCFlags = listOf("-fPIC", "-mno-outline-atomics"),
+            extraCFlags = listOf("-fPIC", "-mno-outline-atomics", "-ffunction-sections", "-fdata-sections"),
         ),
     )
 
@@ -77,6 +84,12 @@ fun hashFiles(vararg files: File): String {
     files.forEach { if (it.exists()) md.update(it.readBytes()) }
     return md.digest().joinToString("") { "%02x".format(it) }.take(12)
 }
+
+// Fingerprint a recipe string (e.g. the per-triple cFlags) into a marker suffix, so changing it forces
+// a rebuild — the archive task is gated on marker existence, not on Gradle's input snapshot.
+fun hashString(s: String): String =
+    java.security.MessageDigest.getInstance("SHA-256").digest(s.toByteArray())
+        .joinToString("") { "%02x".format(it) }.take(12)
 
 // Image content = the Dockerfile only → the image tag / cache key.
 val imageHash = hashFiles(dockerDir.resolve("Dockerfile"))
@@ -389,8 +402,11 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
     // .so (see RFC §10). Both fold in the commit + image (toolchain) hash; the archive marker adds the
     // archive recipe, and the ffi marker adds the archive recipe AND the shim hash (a new commit /
     // toolchain / archive-recipe rebuilds the .a AND forces a relink; a shim edit forces only a relink).
-    val archiveMarker = outDir.resolve("lib/.archives-$boringsslCommit-p$patchSetHash-$imageHash-$archiveRecipeHash")
-    val ffiMarker = outDir.resolve("lib/.ffi-$boringsslCommit-p$patchSetHash-$imageHash-$archiveRecipeHash-$shimHash")
+    // The cFlags fingerprint (lean/section flags live in build.gradle.kts, NOT build-archives.sh, so
+    // archiveRecipeHash misses them) → a flag change renames the marker and forces a rebuild.
+    val cflagsTag = hashString(t.extraCFlags.joinToString(" "))
+    val archiveMarker = outDir.resolve("lib/.archives-$boringsslCommit-p$patchSetHash-$imageHash-$archiveRecipeHash-c$cflagsTag")
+    val ffiMarker = outDir.resolve("lib/.ffi-$boringsslCommit-p$patchSetHash-$imageHash-$archiveRecipeHash-c$cflagsTag-$shimHash")
     val crossing = t.crossCc != null && System.getProperty("os.arch") != "aarch64"
     val libDir = outDir.resolve("lib")
 
@@ -403,6 +419,7 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
             inputs.property("commit", boringsslCommit)
             inputs.property("image", imageHash)
             inputs.property("archiveRecipe", archiveRecipeHash)
+            inputs.property("cflags", t.extraCFlags.joinToString(" "))
             inputs.property("container", dockerUsable)
             outputs.dir(outDir)
             outputs.cacheIf { true }

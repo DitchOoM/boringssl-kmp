@@ -1,0 +1,44 @@
+package = com.ditchoom.boringssl.smoke.cryptoonly
+headers = openssl/sha.h openssl/curve25519.h openssl/hkdf.h openssl/digest.h
+# glibc 2.19 (K/N linuxX64 floor) keeps pthread + dl in separate libs.
+linkerOpts = -lpthread -ldl
+
+# libraryPaths + staticLibraries are injected by the generateSmokeDefCryptoOnly task — see
+# build.gradle.kts. Unlike the full-bundle smoke, this links `libcrypto.a` ALONE (no libssl.a) — the
+# standing gate for the provision plugin's cryptoOnly cinterop (Profile 1: buffer's TLS-free closure).
+
+---
+
+#include <openssl/sha.h>
+#include <openssl/curve25519.h>
+#include <openssl/hkdf.h>
+#include <openssl/digest.h>
+#include <stddef.h>
+
+// Crypto-only closure probe. Exercises a representative slice of buffer's frozen crypto subset —
+// SHA256 + X25519 (curve25519) + HKDF — through ONE callable symbol, linked against libcrypto.a ALONE
+// (no libssl.a). A distinct wrapper name/package (vs the full-bundle bssl_smoke_sha256) keeps the two
+// cinterops from colliding in the same compilation. Writes SHA256(data,len) into `out32` for a
+// known-vector assertion and returns 1 only if X25519 and HKDF also succeed; deterministic inputs (no
+// RNG) so the result is stable. If any of this closure secretly pulled a libssl symbol, the
+// crypto-only link would fail and this gate would never build — which is exactly what it guards.
+static inline int bssl_smoke_crypto_probe(const unsigned char *data, size_t len,
+                                          unsigned char *out32) {
+    SHA256(data, len, out32);
+
+    // X25519 over the standard basepoint with a fixed scalar — deterministic, no RNG.
+    static const unsigned char priv[32] = {1};
+    static const unsigned char basepoint[32] = {9};
+    unsigned char shared[32];
+    if (X25519(shared, priv, basepoint) != 1) return 0;
+
+    // HKDF-SHA256 with fixed inputs — deterministic success.
+    static const unsigned char secret[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const unsigned char salt[4] = {8, 9, 10, 11};
+    static const unsigned char info[3] = {12, 13, 14};
+    unsigned char okm[16];
+    if (HKDF(okm, sizeof(okm), EVP_sha256(),
+             secret, sizeof(secret), salt, sizeof(salt), info, sizeof(info)) != 1) return 0;
+
+    return 1;
+}

@@ -119,6 +119,12 @@ open class BoringSslProvisionExtension(private val project: Project) {
      * The generated cinterop is named [cinteropName] (default `boringssl`). [triple] defaults to the
      * target name (the konan preset name — `linuxX64`, `macosArm64`, … — which matches the bundle
      * triple); pass it explicitly only if the target was given a non-default name.
+     *
+     * [cryptoOnly] links `libcrypto.a` alone, omitting `libssl.a` — for a consumer with no TLS/DTLS
+     * surface (e.g. buffer-crypto: hashes, AEAD, curve25519, HKDF, EC). Combined with the archives'
+     * `-ffunction-sections`/`-fdata-sections` and the consumer's `--gc-sections`, the final binary
+     * carries only the referenced crypto closure — never any of libssl. Canonical (unprefixed) bundle
+     * only; ignored for a content-addressed [alias] variant (whose alias table spans crypto + ssl).
      */
     fun cinterop(
         target: KotlinNativeTarget,
@@ -126,6 +132,7 @@ open class BoringSslProvisionExtension(private val project: Project) {
         triple: String = target.name,
         def: File? = null,
         alias: String? = null,
+        cryptoOnly: Boolean = false,
     ) {
         val dir = boringsslDir(triple, alias)
         val includeDir = File(dir, "include")
@@ -152,7 +159,7 @@ open class BoringSslProvisionExtension(private val project: Project) {
             if (alias == null) {
                 buildString {
                     append("\nlibraryPaths = ").append(libDir.absolutePath)
-                    append("\nstaticLibraries = libssl.a libcrypto.a")
+                    append("\nstaticLibraries = ").append(if (cryptoOnly) "libcrypto.a" else "libssl.a libcrypto.a")
                     // glibc floors keep pthread + dl separate (linux); Apple auto-links libSystem.
                     if (isLinux && !baseDeclaresLinker) append("\nlinkerOpts = -lpthread -ldl")
                 }
