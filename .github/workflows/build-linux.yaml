@@ -74,11 +74,14 @@ jobs:
           key: bssl-src-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/patches/**') }}
 
       # THE big one: restore this triple's built archives; a hit turns the from-source build into a no-op.
+      # The `-*` glob also carries the D8 `-b<hash8>` variant dir (empty until boringsslPrefix="true").
       - name: Cache built BoringSSL archives (${{ matrix.triple }})
         uses: actions/cache@v4
         with:
-          path: boringssl-build/libs/boringssl/${{ matrix.triple }}
-          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map', 'boringssl-build/patches/**') }}
+          path: |
+            boringssl-build/libs/boringssl/${{ matrix.triple }}
+            boringssl-build/libs/boringssl/${{ matrix.triple }}-*
+          key: bssl-libs-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map', 'boringssl-build/scripts/build-prefixed-variant.sh', 'boringssl-build/patches/**') }}
 
       - name: Build + floor-gate + package (${{ matrix.triple }})
         run: |
@@ -104,6 +107,17 @@ jobs:
         if: ${{ matrix.triple == 'linuxX64' }}
         run: ./gradlew :boringssl-provision:test --stacktrace
 
+      # ── D8 content-addressed variant (RFC §12 D8): package the b<hash8> PREFIXED variant + its ELF
+      #    alias adapter (same manylinux2014 container). The Gradle tasks are `onlyIf { prefixEnabled }`,
+      #    so while the catalog flag boringsslPrefix="false" this is a skipped no-op and the lane's
+      #    behavior is byte-for-byte unchanged. linuxX64 only (the linuxArm64 variant is a follow-up).
+      - name: "Package content-addressed variant (${{ matrix.triple }}; no-op while boringsslPrefix=false)"
+        if: ${{ matrix.triple == 'linuxX64' }}
+        run: |
+          ARGS=""
+          [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
+          ./gradlew :boringssl-build:packageBoringSslVariantLinuxX64 $ARGS --stacktrace
+
       # ── One-line consumer resolve (RFC §4 / item 1): publish the provision plugin to mavenLocal and
       #    run samples/cinterop-consumer — a STANDALONE external build that gets K/N BoringSSL via
       #    `boringssl.cinterop(linuxX64())` with NO hand-written .def. Runs natively on the x64 runner so
@@ -126,10 +140,16 @@ jobs:
           # The K/N tarball (+ checksum + provenance) AND the FFM shared library (+ checksum). The .so
           # is a separate artifact — it ships in the boringssl-jvm MRJAR, not the K/N bundle — but it
           # rides in the same upload so validate-artifacts fetches everything for this triple at once.
+          # The `-b*` globs carry the D8 content-addressed variant when boringsslPrefix="true"; while
+          # the flag is "false" they match nothing, which is fine — `if-no-files-found: error` only
+          # fires when NO path matches at all, and the canonical tarball always does.
           path: |
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz.sha256
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.provenance.json
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}-b*.tar.gz
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}-b*.tar.gz.sha256
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}-b*.provenance.json
             boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.so
             boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.so.sha256
           if-no-files-found: error

@@ -1302,8 +1302,8 @@ val packageApple =
 // triple + its plain->b<hash>_ alias adapter (via scripts/build-prefixed-variant.sh — the productionized
 // spike), packaged as the DISTINCT `-<alias>` coordinate `boringssl-<ver>-<triple>-<alias>.tar.gz`. The
 // variant coexists in-process with the canonical unprefixed copy (quiche's) with no symbol collision.
-// Linux/Android variant lanes drive the SAME script with their toolchain args (follow-up); Apple is the
-// runtime-validated proof here. Inert unless the flag is set.
+// The Linux (ELF) lane below drives the SAME script inside the manylinux2014 container; Android is a
+// follow-up. Apple is the runtime-validated proof here. Inert unless the flag is set.
 
 // Variant source: reuse the canonical clone when the commit matches (no second literal); else a
 // dedicated shallow clone of the variant commit (unpatched — the patch axis D9 rides the canonical pin).
@@ -1430,6 +1430,133 @@ tasks.register("buildBoringSslVariantApple") {
     dependsOn(appleVariantPackages)
 }
 
+// ── Linux content-addressed variant (D8) — the ELF twin of the Apple lane above ─────────────────────
+// Drives the SAME scripts/build-prefixed-variant.sh (--format elf → adapter/aliases.elf.ld) inside the
+// SAME manylinux2014 (glibc 2.17) container as the canonical lane, so the variant archives carry the
+// identical K/N glibc floor. linuxX64 first (the triple buffer/socket consume; the coexistence gate
+// runs on it); linuxArm64 is a follow-up. Inert unless boringsslPrefix="true".
+fun registerLinuxVariant(t: NativeTriple): TaskProvider<Task> {
+    val cap = t.id.replaceFirstChar { it.uppercase() }
+    val outDir = projectDir.resolve("libs/boringssl/${t.id}-$variantAlias")
+    val libDir = outDir.resolve("lib")
+    // Same marker/fingerprint discipline as the canonical lane: the variant commit, alias, patch set,
+    // container image (toolchain), variant-script recipe, and cFlags ALL fold into the marker name, so
+    // any recipe change renames the marker and forces a rebuild (writeMarker drops stale siblings).
+    val cflagsTag = hashString(t.extraCFlags.joinToString(" "))
+    val scriptTag = hashFiles(variantScript)
+    val marker = libDir.resolve(".variant-$variantCommit-$variantAlias-p$patchSetHash-$imageHash-s$scriptTag-c$cflagsTag")
+
+    val build =
+        tasks.register("buildBoringSslVariant$cap") {
+            group = "boringssl"
+            description = "Build the content-addressed b<hash8> PREFIXED variant + ELF alias adapter for ${t.id} (D8)."
+            onlyIf { prefixEnabled }
+            dependsOn(fetchBoringSslVariant)
+            inputs.property("variantCommit", variantCommit)
+            inputs.property("prefix", variantAlias)
+            inputs.property("cflags", t.extraCFlags.joinToString(" "))
+            inputs.property("image", imageHash)
+            inputs.file(variantScript)
+            outputs.dir(outDir)
+            doLast {
+                if (marker.exists() && libDir.resolve("libcrypto.a").exists()) {
+                    logger.lifecycle("Linux variant ${t.id}-$variantAlias: up-to-date — skipping.")
+                    return@doLast
+                }
+                outDir.deleteRecursively()
+                // Same lean flags as the canonical archives (fingerprinted into the marker above).
+                val cFlags = t.extraCFlags.joinToString(" ")
+                val cmakeExtra = listOf("-DCMAKE_C_FLAGS=$cFlags", "-DCMAKE_CXX_FLAGS=$cFlags")
+                if (dockerUsable) {
+                    // ── CANONICAL: run the variant script inside manylinux2014 (glibc 2.17), same
+                    //    container flow as buildBoringSslArchives$cap. Paths translate host→container
+                    //    via the /work bind-mount of the repo root. ──
+                    val tag = imageTag(t.dockerArch)
+                    ensureImage(t.dockerArch, t.dockerPlatform, tag)
+                    val uid = execCapture("id", "-u")
+                    val gid = execCapture("id", "-g")
+                    fun containerPath(f: File) = "/work/" + f.relativeTo(rootDir).path
+                    logger.lifecycle("Building content-addressed variant $variantAlias for ${t.id} in $tag (glibc 2.17)...")
+                    runOrThrow(
+                        "docker", "run", "--rm", "--platform", t.dockerPlatform,
+                        "--user", "$uid:$gid", "-e", "HOME=/tmp", "-e", "CC=cc",
+                        "-v", "${rootDir.absolutePath}:/work",
+                        tag, "bash", containerPath(variantScript),
+                        "--src", containerPath(variantSrcDir), "--out", containerPath(outDir),
+                        "--prefix", variantAlias, "--format", "elf", "--", *cmakeExtra.toTypedArray(),
+                        dir = projectDir, what = "container prefixed variant ${t.id}",
+                    )
+                } else {
+                    // ── DEV FALLBACK (-PnoContainer or no docker): host build. NOT glibc-floor-safe on
+                    //    a modern host — dev iteration only, same caveat as the canonical archives. ──
+                    logger.warn("variant note: ${t.id}-$variantAlias built on the HOST (no container) — not release-portable.")
+                    runOrThrow(
+                        "bash", variantScript.absolutePath,
+                        "--src", variantSrcDir.absolutePath, "--out", outDir.absolutePath,
+                        "--prefix", variantAlias, "--format", "elf", "--", *cmakeExtra.toTypedArray(),
+                        dir = projectDir, what = "prefixed variant ${t.id}",
+                    )
+                }
+                require(libDir.resolve("libcrypto.a").exists()) { "variant libcrypto.a missing for ${t.id}" }
+                require(outDir.resolve("adapter/aliases.elf.ld").exists()) {
+                    "variant ELF alias adapter missing for ${t.id} (adapter/aliases.elf.ld)"
+                }
+                writeMarker(marker, ".variant-", "google/boringssl @ $variantCommit PREFIX=$variantAlias ${t.id} [${if (dockerUsable) "container:manylinux2014" else "host"}]\n")
+                logger.lifecycle("Content-addressed variant built: ${t.id}-$variantAlias → $libDir")
+            }
+        }
+
+    return tasks.register("packageBoringSslVariant$cap") {
+        group = "boringssl"
+        description = "Package the ${t.id} b<hash8> variant into boringssl-$bundleVersion-${t.id}-$variantAlias.tar.gz (D8)."
+        onlyIf { prefixEnabled }
+        dependsOn(build)
+        doLast {
+            val dist = distDir.get().asFile.apply { mkdirs() }
+            val tarFile = dist.resolve("boringssl-$bundleVersion-${t.id}-$variantAlias.tar")
+            val tarGz = dist.resolve("boringssl-$bundleVersion-${t.id}-$variantAlias.tar.gz")
+            tarGz.delete()
+            // Deterministic GNU tar → `gzip -n` (same recipe as the canonical Linux packaging), over
+            // lib/ + include/ + adapter/ (the generated plain->b<hash>_ alias table + prefix header).
+            runOrThrow(
+                "tar", "--sort=name", "--mtime=@$sourceDateEpoch",
+                "--owner=0", "--group=0", "--numeric-owner", "--exclude=.variant-*",
+                "-cf", tarFile.absolutePath, "-C", outDir.absolutePath, "include", "lib", "adapter",
+                dir = dist, what = "tar ${t.id}-$variantAlias",
+            )
+            runOrThrow("gzip", "-nf", tarFile.absolutePath, dir = dist, what = "gzip ${t.id}-$variantAlias")
+            val digest = sha256Of(tarGz)
+            dist.resolve("${tarGz.name}.sha256").writeText("$digest  ${tarGz.name}\n")
+            dist.resolve("boringssl-$bundleVersion-${t.id}-$variantAlias.provenance.json").writeText(
+                """
+                {
+                  "artifact": "${tarGz.name}",
+                  "sha256": "$digest",
+                  "variant": true,
+                  "boringsslCommit": "$variantCommit",
+                  "prefix": "$variantAlias",
+                  "alias": "$variantAlias",
+                  "quicheAbi": "${catalog.findVersion("boringsslQuicheAbi").get().requiredVersion}",
+                  "triple": "${t.id}",
+                  "bundleVersion": "$bundleVersion",
+                  "sourceDateEpoch": $sourceDateEpoch
+                }
+                """.trimIndent() + "\n",
+            )
+            logger.lifecycle("Packaged variant ${t.id}-$variantAlias: ${tarGz.name}  sha256=$digest")
+        }
+    }
+}
+
+val linuxVariantPackages = linuxTriples.filter { it.id == "linuxX64" }.map { registerLinuxVariant(it) }
+
+tasks.register("buildBoringSslVariantLinux") {
+    group = "boringssl"
+    description = "Build the content-addressed b<hash8> variant for the wired Linux triples (D8; needs boringsslPrefix=true)."
+    onlyIf { prefixEnabled }
+    dependsOn(linuxVariantPackages)
+}
+
 // `assemble` produces the distributable tarballs. Apple rides along only on a macOS host (the Apple
 // tasks require Xcode); Linux/CI runners that invoke a specific packageBoringSsl<Triple> task are
 // unaffected. The content-addressed variant rides along only when boringsslPrefix="true".
@@ -1437,4 +1564,5 @@ tasks.named("assemble") {
     dependsOn(packageLinux)
     if (isMacHost) dependsOn(packageApple)
     if (isMacHost && prefixEnabled) dependsOn(appleVariantPackages)
+    if (prefixEnabled) dependsOn(linuxVariantPackages)
 }
