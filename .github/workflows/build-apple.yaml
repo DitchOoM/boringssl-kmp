@@ -94,11 +94,14 @@ jobs:
 
       # THE big one: restore this triple's built archives + dylib; a hit turns the build into a no-op.
       # Keyed on the commit + the Apple build/shim recipe (build.gradle.kts + the FFM shim surface).
+      # The `-*` glob also carries the D8 `-b<hash8>` variant dir (empty until boringsslPrefix="true").
       - name: Cache built BoringSSL archives (${{ matrix.triple }})
         uses: actions/cache@v4
         with:
-          path: boringssl-build/libs/boringssl/${{ matrix.triple }}
-          key: bssl-apple-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/build.gradle.kts', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/patches/**') }}
+          path: |
+            boringssl-build/libs/boringssl/${{ matrix.triple }}
+            boringssl-build/libs/boringssl/${{ matrix.triple }}-*
+          key: bssl-apple-${{ matrix.triple }}-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/build.gradle.kts', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/scripts/build-prefixed-variant.sh', 'boringssl-build/patches/**') }}
 
       # Build + per-SDK link-smoke + package (the pkg task dependsOn build + linkFfi + smoke).
       - name: Build + link-smoke + package (${{ matrix.triple }})
@@ -106,6 +109,16 @@ jobs:
           ARGS=""
           [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
           ./gradlew :boringssl-build:packageBoringSslApple${{ matrix.cap }} $ARGS --stacktrace
+
+      # ── D8 content-addressed variant (RFC §12 D8): build + package the b<hash8> PREFIXED variant +
+      #    its Mach-O alias adapter under the distinct `-<alias>` coordinate. The Gradle tasks are
+      #    `onlyIf { prefixEnabled }`, so while the catalog flag boringsslPrefix="false" this is a
+      #    skipped no-op and the lane's behavior is byte-for-byte unchanged.
+      - name: "Package content-addressed variant (${{ matrix.triple }}; no-op while boringsslPrefix=false)"
+        run: |
+          ARGS=""
+          [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
+          ./gradlew :boringssl-build:packageBoringSslVariantApple${{ matrix.cap }} $ARGS --stacktrace
 
       # Binary-shaped guards: checksums, extract, headers, exactly-one-libcrypto, un-mangled statics,
       # and (macOS) the dylib single-copy symbol-hiding check.
@@ -145,10 +158,16 @@ jobs:
           name: boringssl-${{ matrix.triple }}
           # The K/N tarball (+ checksum + provenance) AND, for macOS, the FFM dylib (+ checksum). The
           # dylib ships in the boringssl-jvm MRJAR, not the K/N bundle, but rides in the same upload.
+          # The `-b*` globs carry the D8 content-addressed variant when boringsslPrefix="true"; while
+          # the flag is "false" they match nothing, which is fine — `if-no-files-found: error` only
+          # fires when NO path matches at all, and the canonical tarball always does.
           path: |
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.tar.gz.sha256
             boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}.provenance.json
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}-b*.tar.gz
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}-b*.tar.gz.sha256
+            boringssl-build/build/dist/boringssl-*-${{ matrix.triple }}-b*.provenance.json
             boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.dylib
             boringssl-build/build/dist/libboringsslffi-*-${{ matrix.triple }}.dylib.sha256
           if-no-files-found: error
