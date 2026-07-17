@@ -31,8 +31,20 @@ jobs:
   grep-gate:
     name: "Standing directives (grep-gate)"
     runs-on: ubuntu-24.04
+    outputs:
+      # The D8 content-addressed-variant flag, read ONCE from the catalog so downstream jobs (the
+      # coexistence gate) can condition on it without a checkout of their own.
+      prefix_enabled: ${{ steps.d8-flag.outputs.enabled }}
     steps:
       - uses: actions/checkout@v6
+      - name: "Read the D8 content-addressed-variant flag (boringsslPrefix)"
+        id: d8-flag
+        run: |
+          if grep -qE '^boringsslPrefix = "true"' gradle/libs.versions.toml; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
       # Binary-repo standing directives (RFC §8), CI-enforced.
       - name: "No committed native binaries"
         run: |
@@ -130,3 +142,28 @@ jobs:
           cp dist/libboringsslffi-*-${{ matrix.triple }}.so \
              "boringssl-build/libs/boringssl/${{ matrix.triple }}/lib/libboringsslffi.so"
           ./gradlew :boringssl-jvm:jvm21Test --rerun-tasks --stacktrace
+
+  # ── D8 COEXISTENCE gate (RFC §12 D8) — armed ONLY while the catalog flag boringsslPrefix="true". ──
+  # The standing promotion of the spikes/d8-alias-shim proof onto the REAL released bundles: links the
+  # canonical UNPREFIXED linuxX64 tarball AND the content-addressed b<hash8> PREFIXED variant into ONE
+  # ELF binary, nm-asserts EXACTLY ONE unprefixed SHA256_Init (D8 lifts D3 to "one copy per distinct
+  # commit" — it never breaks the single-unprefixed-copy invariant), and runs the SHA-256("abc") KAT
+  # through BOTH copies. While the flag is "false" the build lanes produce no variant tarball and this
+  # job is skipped — PR CI is unchanged until the flag flips.
+  coexistence-gate:
+    name: "D8 coexistence gate (linuxX64)"
+    needs: [grep-gate, build-linux]
+    if: needs.grep-gate.outputs.prefix_enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download linuxX64 bundle (canonical + b<hash8> variant)
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linuxX64
+          path: dist
+
+      - name: "Coexistence: canonical + variant in ONE binary (nm single-copy + KATs through both)"
+        run: bash boringssl-build/scripts/validate-coexistence.sh linuxX64 dist
