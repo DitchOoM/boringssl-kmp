@@ -17,15 +17,28 @@ import java.security.MessageDigest
  *
  * Resolution order for a triple (first hit wins):
  *   1. `localDist` (a `:boringssl-build` `build/dist` dir) — used during migration BEFORE any release
- *      exists; verified against the sibling `<tarball>.sha256`.
+ *      exists; verified against the sibling `<tarball>.sha256`. Defaults from
+ *      `-PboringsslLocalBundle=<dir>` (see [BoringSslProvisionExtension.localDist]).
  *   2. Remote: `<baseUrl>/<version>/boringssl-<version>-<triple>.tar.gz`, fetched by STABLE DIRECT URL
  *      (never the `/releases/latest` API — avoids the 60-req/hr unauthenticated limit, RFC §3), then
  *      verified against the BAKED-IN checksum in [checksums] (no TOFU).
- * Verified tarballs extract once into `<cacheRoot>/<version>/<triple>/{include,lib}`.
+ * Verified tarballs extract once into `<cacheRoot>/<version>/<triple>/{include,lib}`, guarded by a
+ * marker keyed on version + tarball sha256 — a same-version tarball with DIFFERENT bits (local
+ * candidate iteration) busts the marker and re-extracts cleanly instead of silently no-opping. If the
+ * source later becomes unresolvable (producer dist cleaned, no baked checksum), an already-provisioned
+ * extraction keeps serving — a resolvable source is only required when (re)extraction is needed.
  */
 class BoringSslProvisionPlugin : Plugin<Project> {
     override fun apply(target: Project) {
-        target.extensions.create("boringssl", BoringSslProvisionExtension::class.java, target)
+        val extension = target.extensions.create("boringssl", BoringSslProvisionExtension::class.java, target)
+        // `-PboringsslLocalBundle=<dir>` (absolute, or relative to the ROOT project dir) seeds
+        // `localDist` — the CLI override for iterating on a locally built candidate bundle without
+        // touching the build script. Apply-time default only: the consumer's `boringssl { }` block runs
+        // after apply(), so an explicit `localDist = …` assignment there still wins.
+        target.providers.gradleProperty("boringsslLocalBundle").orNull?.let { path ->
+            val dir = File(path)
+            extension.localDist = if (dir.isAbsolute) dir else File(target.rootDir, path)
+        }
     }
 }
 
@@ -51,7 +64,11 @@ open class BoringSslProvisionExtension(private val project: Project) {
     /**
      * Optional local `:boringssl-build` dist dir. When set and it contains the tarball, it is used
      * instead of a network fetch (dev + the migration window before the first release). Verified
-     * against the sibling `.sha256`.
+     * against the sibling `.sha256`; when that sidecar is absent the tarball is SELF-hashed — a
+     * documented break-glass with a loud warning (structural checks become the only verification).
+     *
+     * Defaults from `-PboringsslLocalBundle=<dir>` (absolute, or relative to the root project dir),
+     * wired at plugin apply time; an explicit assignment here always wins over the property.
      */
     var localDist: File? = null
 
@@ -83,16 +100,32 @@ open class BoringSslProvisionExtension(private val project: Project) {
         val suffix = alias?.let { "-$it" } ?: ""
         val key = "$triple$suffix"
         val dest = File(cacheRoot, "$version/$key")
-        val marker = File(dest, ".provisioned-$version")
+        val tarName = "boringssl-$version-$key.tar.gz"
+
+        // The expected sha256 is knowable WITHOUT fetching (baked map / localDist sidecar / self-hash),
+        // so the extraction marker keys on version + sha: a same-version tarball with different bits
+        // (local candidate iteration) misses the marker and forces a clean re-extraction.
+        val (expected, materialize) =
+            try {
+                resolveTarball(key, tarName)
+            } catch (e: GradleException) {
+                // Source unresolvable (localDist wiped by a producer clean, no baked checksum — the
+                // migration window between producer rebuilds). An existing extraction was sha-verified
+                // when its marker was written, so it keeps serving; a resolvable source is only
+                // required when (re)extraction is actually needed.
+                if (provisioned(dest)) return dest
+                throw e
+            }
+        val marker = File(dest, ".provisioned-$version-${expected.lowercase().take(12)}")
         if (marker.exists() && File(dest, "lib").isDirectory && File(dest, "include").isDirectory) return dest
 
-        val tarName = "boringssl-$version-$key.tar.gz"
-        val (tarball, expected) = resolveTarball(key, tarName)
+        val tarball = materialize()
         val actual = sha256(tarball)
         if (!expected.equals(actual, ignoreCase = true)) {
             throw GradleException("BoringSSL bundle checksum mismatch for $triple: expected $expected, got $actual (from ${tarball.absolutePath})")
         }
 
+        // Clean any stale extraction (previous bits AND its old sha-keyed marker) before re-extracting.
         dest.deleteRecursively(); File(dest, "lib").mkdirs(); File(dest, "include").mkdirs()
         val code = ProcessBuilder("tar", "xzf", tarball.absolutePath, "-C", dest.absolutePath)
             .redirectErrorStream(true).start()
@@ -193,14 +226,35 @@ open class BoringSslProvisionExtension(private val project: Project) {
         project.logger.info("boringssl.cinterop: wired '$cinteropName' for $triple$suffix → def=${generatedDef.absolutePath}")
     }
 
-    /** Resolve the tarball (local dist or download) and its expected checksum. */
-    private fun resolveTarball(triple: String, tarName: String): Pair<File, String> {
+    /** True when [dest] holds a completed extraction for [version]: a sha-keyed marker plus lib/ + include/. */
+    private fun provisioned(dest: File): Boolean =
+        File(dest, "lib").isDirectory &&
+            File(dest, "include").isDirectory &&
+            dest.listFiles().orEmpty().any { it.name.startsWith(".provisioned-$version-") }
+
+    /**
+     * Resolve [tarName]'s expected checksum plus a materializer producing the tarball itself (the
+     * [localDist] file, or the download-cache copy after fetching). The checksum is knowable WITHOUT
+     * fetching — the sidecar `.sha256` (or break-glass self-hash) for [localDist], the baked-in
+     * [checksums] entry (no TOFU; missing entry = hard error) for a remote — so [boringsslDir] can key
+     * its extraction marker on it before paying for any download.
+     */
+    private fun resolveTarball(triple: String, tarName: String): Pair<String, () -> File> {
         localDist?.let { dist ->
             val local = File(dist, tarName)
             if (local.exists()) {
                 val shaFile = File(dist, "$tarName.sha256")
-                val expected = if (shaFile.exists()) shaFile.readText().trim().substringBefore(" ") else sha256(local)
-                return local to expected
+                val expected =
+                    if (shaFile.exists()) {
+                        shaFile.readText().trim().substringBefore(" ")
+                    } else {
+                        project.logger.warn(
+                            "boringssl: no $tarName.sha256 sidecar in ${dist.absolutePath} — self-hashing the local " +
+                                "tarball (break-glass: the structural checks are the only verification).",
+                        )
+                        sha256(local)
+                    }
+                return expected to { local }
             }
         }
         val expected = checksums[triple]
@@ -208,14 +262,16 @@ open class BoringSslProvisionExtension(private val project: Project) {
                 "No baked-in checksum for $triple (version $version) and no localDist tarball. " +
                     "Set boringssl { checksums = mapOf(\"$triple\" to \"<sha256>\") } or point localDist at :boringssl-build/build/dist.",
             )
-        val cached = File(cacheRoot, "downloads/$tarName")
-        if (!cached.exists()) {
-            cached.parentFile.mkdirs()
-            val url = "$baseUrl$version/$tarName"
-            project.logger.lifecycle("Downloading BoringSSL bundle: $url")
-            URI(url).toURL().openStream().use { input -> cached.outputStream().use { input.copyTo(it) } }
+        return expected to {
+            val cached = File(cacheRoot, "downloads/$tarName")
+            if (!cached.exists()) {
+                cached.parentFile.mkdirs()
+                val url = "$baseUrl$version/$tarName"
+                project.logger.lifecycle("Downloading BoringSSL bundle: $url")
+                URI(url).toURL().openStream().use { input -> cached.outputStream().use { input.copyTo(it) } }
+            }
+            cached
         }
-        return cached to expected
     }
 
     private fun sha256(f: File): String {

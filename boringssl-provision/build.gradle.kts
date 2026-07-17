@@ -39,13 +39,33 @@ repositories {
     gradlePluginPortal()
 }
 
+// TestKit builds resolve the plugin from `withPluginClasspath()` (the java-gradle-plugin metadata =
+// the plugin's RUNTIME classpath, which excludes the compileOnly KGP). Gradle's extension decoration
+// reflects over the `cinterop(KotlinNativeTarget, …)` signature, so KGP must ride along for the build
+// under test — a dedicated configuration keeps it out of the shipped plugin's own dependencies.
+val testKitPluginClasspath: Configuration by configurations.creating { isCanBeConsumed = false }
+
 dependencies {
     // The `boringssl.cinterop(target)` helper (RFC §4) types against KotlinNativeTarget. compileOnly:
     // the Kotlin Gradle plugin is ALWAYS on the classpath of the consumer build that applies this
     // plugin (it applies `kotlin("multiplatform")`), so it must not be bundled into or forced by the
     // provision plugin's own runtime — only visible at compile time.
     compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
+
+    // Plugin unit + functional tests (src/test). Plain JUnit4 (no junit entry exists in the catalog;
+    // kotlin-test is skipped to keep the embedded-Kotlin compiler off 2.4-metadata test libs). KGP is
+    // testRuntimeOnly for the same extension-decoration reason as testKitPluginClasspath above.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(gradleTestKit())
+    testRuntimeOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
+    testKitPluginClasspath("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
 }
+
+tasks.named<org.gradle.plugin.devel.tasks.PluginUnderTestMetadata>("pluginUnderTestMetadata") {
+    pluginClasspath.from(testKitPluginClasspath)
+}
+
+tasks.withType<Test>().configureEach { useJUnit() }
 
 // ── Baked-in checksums resource (no TOFU — RFC §8 directive #4) ───────────────────────────────────
 // bakeChecksums reads a SHA256SUMS file (the release job's aggregated tarball digests) and writes
