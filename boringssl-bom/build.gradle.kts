@@ -43,6 +43,9 @@ dependencies {
         api("com.ditchoom.boringssl:boringssl-provision:${project.version}")
         api("com.ditchoom.boringssl:boringssl-jvm:${project.version}")
         api("com.ditchoom.boringssl:boringssl-android:${project.version}")
+        // The bindings-free K/N owner klib (linux only, RFC §12 D3) — a co-linking consumer depends on
+        // it to embed the ONE canonical archive; pinned here so the whole matrix stays coherent.
+        api("com.ditchoom.boringssl:boringssl-canonical:${project.version}")
         // The content-addressed variant coordinates, tied to the SAME packaging version (D8). Guarded on
         // the flag that produces them, so the BOM pins them exactly when they publish (item 5 follow-up
         // wires the -<alias> jvm/android artifacts; the build-side variant tarball lands in this PR).

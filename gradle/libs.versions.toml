@@ -43,6 +43,11 @@ boringsslVariantCommit = "canonical"
 
 [libraries]
 # Consumer modules add their own dependencies; nothing shared is needed for the phase-1 skeleton.
+#
+# The bindings-free canonical OWNER klib (RFC §2/§12 D3). Version-less: the coordinate is versioned by
+# the release (project.version, pinned in the BOM), so this alias only registers the coordinate — the
+# co-linking OWNER a consumer depends on to embed the ONE canonical BoringSSL archive (linux only).
+boringssl-canonical = { module = "com.ditchoom.boringssl:boringssl-canonical" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
