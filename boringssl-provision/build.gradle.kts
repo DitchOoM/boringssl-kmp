@@ -54,10 +54,12 @@ dependencies {
 
     // Plugin unit + functional tests (src/test). Plain JUnit4 (no junit entry exists in the catalog;
     // kotlin-test is skipped to keep the embedded-Kotlin compiler off 2.4-metadata test libs). KGP is
-    // testRuntimeOnly for the same extension-decoration reason as testKitPluginClasspath above.
+    // testImplementation: the owner/external cinterop-emission tests (BoringSslCinteropEmbedArchiveTest)
+    // build a real KotlinNativeTarget under ProjectBuilder and so need KGP types at COMPILE time too,
+    // not just runtime (extension decoration) as the TestKit build-under-test does (testKitPluginClasspath).
     testImplementation("junit:junit:4.13.2")
     testImplementation(gradleTestKit())
-    testRuntimeOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
+    testImplementation("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
     testKitPluginClasspath("org.jetbrains.kotlin:kotlin-gradle-plugin:${libs.versions.kotlin.get()}")
 }
 
