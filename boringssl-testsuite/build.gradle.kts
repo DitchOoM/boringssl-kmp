@@ -90,6 +90,20 @@ val knHostSupported =
             System.getProperty("os.arch").orEmpty() in listOf("aarch64", "arm64")
     )
 
+// ── co-link check: :boringssl-canonical OWNER + two EXTERNAL headers-only cinterops ──
+// The static defs below carry NO libraryPaths/staticLibraries (headers only), so they embed no
+// archive; their crypto + libssl refs resolve at final link against the co-linked BoringSSL archives
+// on the linuxX64Test link line — the :boringssl-canonical owner klib is one such co-linked source,
+// so this proves a headers-only external consumer LINKS + RUNS against a co-linked owner. NOTE: this
+// in-build compilation also carries the archive-embedding smoke/cryptoOnly cinterops, so the owner is
+// co-linked but is NOT the sole archive source here; the "exactly one embedder" topology invariant is
+// enforced by the provision plugin's embedArchive flag (real consumers embed only via the owner) and
+// the ARCHIVE-level single-copy nm guard in validate-artifacts check 8. Unlike the smoke defs there is
+// nothing to inject, so the cinterops point straight at the checked-in def files — only the BoringSSL
+// headers must exist first.
+val extCryptoDef = layout.projectDirectory.file("src/nativeInterop/cinterop/boringsslcanonical_ext_crypto.def")
+val extSslDef = layout.projectDirectory.file("src/nativeInterop/cinterop/boringsslcanonical_ext_ssl.def")
+
 if (knHostSupported) {
     kotlin {
         linuxX64 {
@@ -101,7 +115,24 @@ if (knHostSupported) {
                 defFile(project.file("build/generated/cinterop/boringsslsmoke_cryptoonly.def"))
                 includeDirs(provisioned.resolve("include"))
             }
+            // EXTERNAL (embedArchive=false) surfaces — headers only, no archive embedded.
+            compilations.getByName("main").cinterops.create("boringsslCanonicalExtCrypto") {
+                defFile(extCryptoDef.asFile)
+                includeDirs(provisioned.resolve("include"))
+            }
+            compilations.getByName("main").cinterops.create("boringsslCanonicalExtSsl") {
+                defFile(extSslDef.asFile)
+                includeDirs(provisioned.resolve("include"))
+            }
         }
+    }
+
+    // Co-link the OWNER klib via an IN-BUILD project dependency (not the mavenLocal-published external
+    // coordinate) so it (and its transitive `-cinterop` klib + embedded archive) lands on the final
+    // linuxX64Test link line alongside the two external cinterops. The mavenLocal GMM/`-cinterop`
+    // distribution seam is exercised separately by the publish-smoke step in build-linux.yaml.
+    dependencies {
+        add("linuxX64TestImplementation", project(":boringssl-canonical"))
     }
 
     // Each cinterop must see its generated def (and thus the built archive) first.
@@ -110,6 +141,14 @@ if (knHostSupported) {
     }
     tasks.matching { it.name == "cinteropBoringsslsmokeCryptoonlyLinuxX64" }.configureEach {
         dependsOn(generateSmokeDefCryptoOnly)
+    }
+    // The external cinterops need only the BoringSSL headers (includeDirs) present — the archive stage
+    // produces both headers and archives, so depend on it directly.
+    tasks.matching { it.name == "cinteropBoringsslCanonicalExtCryptoLinuxX64" }.configureEach {
+        dependsOn(buildArchiveTask)
+    }
+    tasks.matching { it.name == "cinteropBoringsslCanonicalExtSslLinuxX64" }.configureEach {
+        dependsOn(buildArchiveTask)
     }
 }
 

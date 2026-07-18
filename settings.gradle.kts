@@ -31,4 +31,5 @@ include(":boringssl-provision")   // Gradle plugin: download + sha256-verify tar
 include(":boringssl-jvm")         // FFM producer: MRJAR (shared lib + jextract bindings) → Central
 include(":boringssl-android")     // AAR producer: prefab (static .a + headers per ABI) → Central
 include(":boringssl-bom")         // BOM: pins coordinates + records canonical commit / quiche anchor → Central
+include(":boringssl-canonical")   // bindings-free K/N owner klib: embeds the ONE canonical archive (linux only) → Central
 include(":boringssl-testsuite")   // per-target link-smoke validation; wired into validate-artifacts

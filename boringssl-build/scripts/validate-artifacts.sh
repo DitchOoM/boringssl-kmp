@@ -20,6 +20,13 @@
 #      symbol is hidden                                                (D3 single-copy tripwire)
 #   6. records the .so size (Android per-ABI budget is enforced on the static subset in step 7)
 #   7. every symbol in contracts/*.txt is DEFINED in libcrypto.a       (consumer symbol contracts)
+#   8. archive-level single-copy set-membership: the owner-embedded archives carry exactly one definition
+#      of each crypto entry point — 1 SHA256_Init, 1 defn per sha256_block_data_order ISA-variant NAME
+#      (the SET of variant names, not raw nm lines), 1 SSL_CTX_new. This is the ARCHIVE-level tripwire for
+#      the D10 owner-one-copy invariant (a malformed archive with a duplicated definition fails here); the
+#      runtime co-link check in :boringssl-testsuite:linuxX64Test proves the archive links + runs
+#   9. pin alignment: the artifact's provenance.json boringsslCommit == catalog `boringssl` AND its
+#      quicheAbi == catalog `boringsslQuicheAbi` — owner==quiche==catalog can't drift  (D1/D10)
 # ─────────────────────────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -143,5 +150,65 @@ done
 if [ -n "$missing" ]; then
   fail "symbol contract violated — consumer-closure symbols NOT defined in libcrypto.a:"$'\n'"$missing"
 fi
+
+# ── 8. archive-level single-copy set-membership (D10 owner one-copy invariant) ──────
+# The canonical owner klib (:boringssl-canonical, embedArchive=true) EMBEDS this exact libcrypto.a /
+# libssl.a, and every consumer co-links against the SAME copy (external cinterop, embedArchive=false).
+# Guard the SOURCE archive here: it must carry exactly ONE definition of each crypto entry point.
+# BoringSSL ships sha256_block_data_order in several micro-arch variants (…_shaext / _avx / _ssse3 /
+# _hw / …) — count the SET of distinct variant NAMES, each DEFINED exactly once, NOT raw nm lines (many
+# variant names is still ONE copy; a single name defined twice = a duplicated crypto copy = fail). This
+# is the ARCHIVE-level tripwire (a malformed embed with a duplicated def fails here); the runtime
+# co-link check (:boringssl-testsuite:linuxX64Test) separately proves the archive links + runs. Reuses
+# the check-4 `crypto_syms` capture (see the SIGPIPE note there). Underscore-tolerant like checks 4/7.
+crypto_defs="$(awk '$2=="T"{sub(/^_/,"",$3); print $3}' <<<"$crypto_syms")"
+# 8a. SHA256_Init: exactly one definition.
+sha_init_defs="$(grep -cxF 'SHA256_Init' <<<"$crypto_defs" || true)"
+[ "$sha_init_defs" -eq 1 ] \
+  || fail "libcrypto.a defines SHA256_Init $sha_init_defs times (expected exactly 1 — duplicate crypto copy?)"
+# 8b. every sha256_block_data_order* ISA-variant NAME defined exactly once.
+variant_names="$(grep -E '^sha256_block_data_order' <<<"$crypto_defs" | sort -u)"
+[ -n "$variant_names" ] || fail "libcrypto.a defines no sha256_block_data_order variant — symbol set unexpected"
+variant_dups=""
+while IFS= read -r v; do
+  [ -n "$v" ] || continue
+  c="$(grep -cxF "$v" <<<"$crypto_defs" || true)"
+  [ "$c" -eq 1 ] || variant_dups+="  $v defined $c times"$'\n'
+done <<<"$variant_names"
+[ -z "$variant_dups" ] \
+  || fail "duplicate crypto ISA-variant definitions (a co-link would carry >1 copy):"$'\n'"$variant_dups"
+# 8c. SSL_CTX_new: exactly one definition in libssl.a (the full owner carries libssl too).
+ssl_syms="$("$NM" "$WORK/lib/libssl.a" 2>/dev/null || true)"
+ssl_ctx_defs="$(awk '$2=="T"{sub(/^_/,"",$3); print $3}' <<<"$ssl_syms" | grep -cxF 'SSL_CTX_new' || true)"
+[ "$ssl_ctx_defs" -eq 1 ] \
+  || fail "libssl.a defines SSL_CTX_new $ssl_ctx_defs times (expected exactly 1)"
+ok "single-copy set-membership: 1 SHA256_Init, $(grep -c . <<<"$variant_names") sha256_block_data_order variant name(s) each once, 1 SSL_CTX_new"
+
+# ── 9. pin alignment — provenance ⇄ catalog (owner==quiche==catalog can't drift; D1/D10) ──────────
+# The owner klib embeds THIS archive, so the artifact's provenance.json IS the owner's embedded-archive
+# provenance. Assert the built pin matches the single-pin catalog: the recorded boringsslCommit equals
+# the catalog `boringssl` value, and the recorded quicheAbi equals the catalog `boringsslQuicheAbi`
+# anchor — so the canonical commit, the quiche ABI anchor, and the catalog can never silently drift
+# (e.g. an artifact built from a stale checkout). Pure text extraction (no jq dependency); the catalog
+# is read live from the checkout, so NO 40-hex literal is embedded in this script (single-pin directive).
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+CATALOG="$REPO_ROOT/gradle/libs.versions.toml"
+[ -f "$CATALOG" ] || fail "catalog not found at $CATALOG"
+provs=("$DIST"/boringssl-*-"$TRIPLE".provenance.json)
+[ "${#provs[@]}" -eq 1 ] || fail "expected exactly one provenance.json for $TRIPLE in $DIST, found ${#provs[@]}"
+PROV="${provs[0]}"
+catalog_commit="$(grep -E '^boringssl = "' "$CATALOG" | sed -E 's/.*"([0-9a-f]{40})".*/\1/')"
+catalog_quiche="$(grep -E '^boringsslQuicheAbi = "' "$CATALOG" | sed -E 's/^[^"]*"([^"]*)".*/\1/')"
+prov_commit="$(grep -E '"boringsslCommit"' "$PROV" | sed -E 's/.*"boringsslCommit"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+prov_quiche="$(grep -E '"quicheAbi"' "$PROV" | sed -E 's/.*"quicheAbi"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+[ -n "$catalog_commit" ] || fail "could not read the boringssl pin from $CATALOG"
+[ -n "$prov_commit" ]    || fail "provenance.json ($PROV) has no boringsslCommit"
+[ -n "$catalog_quiche" ] || fail "could not read boringsslQuicheAbi from $CATALOG"
+[ -n "$prov_quiche" ]    || fail "provenance.json ($PROV) has no quicheAbi"
+[ "$prov_commit" = "$catalog_commit" ] \
+  || fail "provenance boringsslCommit ($prov_commit) != catalog boringssl ($catalog_commit) — pin drift"
+[ "$prov_quiche" = "$catalog_quiche" ] \
+  || fail "provenance quicheAbi ($prov_quiche) != catalog boringsslQuicheAbi ($catalog_quiche) — quiche anchor drift"
+ok "pin alignment: commit=$prov_commit, quiche anchor='$prov_quiche' (provenance ⇄ catalog)"
 
 echo "== validate-artifacts: $TRIPLE OK =="

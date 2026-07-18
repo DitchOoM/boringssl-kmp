@@ -1,0 +1,10 @@
+package = com.ditchoom.boringssl.canonical
+
+# Bindings-FREE owner def. No `headers` and no wrappers → cinterop produces a klib with an EMPTY
+# binding surface. `libraryPaths` + `staticLibraries` (+ the linux pthread/dl floor) are injected by
+# the generateCanonicalDef task (see build.gradle.kts) so the ONE canonical BoringSSL archive rides
+# into the published cinterop klib's `included/` (embedArchive=true semantics — RFC §2: "ship the
+# ingredients, not the bindings"). A co-linking consumer that adds its OWN external (headers-only)
+# cinterops resolves every crypto/ssl symbol against this single embedded copy.
+
+---
