@@ -158,6 +158,35 @@ open class BoringSslProvisionExtension(private val project: Project) {
      * `-ffunction-sections`/`-fdata-sections` and the consumer's `--gc-sections`, the final binary
      * carries only the referenced crypto closure — never any of libssl. Canonical (unprefixed) bundle
      * only; ignored for a content-addressed [alias] variant (whose alias table spans crypto + ssl).
+     *
+     * ## Owner vs external ([embedArchive])
+     * When several K/N modules co-link ONE final binary (e.g. `buffer` + `socket` + `webrtc-dtls`), only
+     * one of them may EMBED the canonical archive — otherwise ld.lld sees the same `libcrypto.a` object
+     * files from two klibs and fails with duplicate-symbol errors.
+     *  - [embedArchive] `= true` (default, **owner** mode — exactly today's behaviour): the generated def
+     *    carries `libraryPaths` + `staticLibraries`, so the cinterop klib EMBEDS the archive into its
+     *    `included/` and contributes it to the final link line. 100% backward-compatible with every
+     *    existing caller (buffer-crypto, samples, testsuite).
+     *  - [embedArchive] `= false` (**external** mode): the generated def OMITS both `libraryPaths` and
+     *    `staticLibraries`, keeping only `headers` + `compilerOpts` + the `includeDirs(<bundle>/include)`
+     *    registered on the cinterop. The klib's `included/` stays empty; K/N auto-propagates the OWNER
+     *    klib's embedded archive to the final link line, so this cinterop's symbol refs resolve against
+     *    that single copy. No `linkerOpts`, no force-load, no marker needed.
+     *
+     * ### Caller responsibilities (not enforced here)
+     *  - **Exactly ONE owner per final-link target.** Every module linked into a given binary must agree
+     *    on which one calls with [embedArchive] `= true`; all others pass `false`. A build-time guardrail
+     *    is a deliberate follow-up — for THIS release it is the caller's contract. Zero owners = undefined
+     *    symbols at link; two owners = duplicate symbols.
+     *  - **ABI parity.** An external consumer's headers MUST come from the SAME catalog-pinned bundle as
+     *    the owner's embedded archive (same [version] + [triple] + BoringSSL commit). Since both resolve
+     *    through [boringsslDir], keep [version]/[triple] identical across the co-linking modules.
+     *
+     * In external mode no archive is embedded, so [cryptoOnly] (which archive the OWNER embeds) and
+     * [alias] (which prefixed variant the owner embeds) are moot and IGNORED — the owner alone decides
+     * the archive; this call only contributes headers. The Linux `-lpthread -ldl` floor is still emitted
+     * in external mode (the final binary needs pthread/dl regardless of which module supplies the
+     * archive), which is harmless with no archive of our own.
      */
     fun cinterop(
         target: KotlinNativeTarget,
@@ -166,6 +195,7 @@ open class BoringSslProvisionExtension(private val project: Project) {
         def: File? = null,
         alias: String? = null,
         cryptoOnly: Boolean = false,
+        embedArchive: Boolean = true,
     ) {
         val dir = boringsslDir(triple, alias)
         val includeDir = File(dir, "include")
@@ -189,7 +219,17 @@ open class BoringSslProvisionExtension(private val project: Project) {
         // refs onto them — Mach-O via ld64 `-alias_list` (lazy), ELF via `--whole-archive` + the PROVIDE
         // script (matching how quiche consumes the external libcrypto, RFC §6).
         val linkLines =
-            if (alias == null) {
+            if (!embedArchive) {
+                // EXTERNAL mode: headers only — OMIT libraryPaths + staticLibraries so this klib's
+                // included/ stays empty and no archive object files enter the link twice. The owner
+                // cinterop (embedArchive = true, same bundle) supplies the single canonical archive; K/N
+                // auto-propagates it to the final link line, resolving these refs. cryptoOnly + alias are
+                // moot (no archive embedded here). Keep the linux platform floor: the final binary needs
+                // pthread/dl regardless of which module owns the archive, and it is harmless standalone.
+                buildString {
+                    if (isLinux && !baseDeclaresLinker) append("\nlinkerOpts = -lpthread -ldl")
+                }
+            } else if (alias == null) {
                 buildString {
                     append("\nlibraryPaths = ").append(libDir.absolutePath)
                     append("\nstaticLibraries = ").append(if (cryptoOnly) "libcrypto.a" else "libssl.a libcrypto.a")
