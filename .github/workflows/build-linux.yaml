@@ -97,16 +97,24 @@ jobs:
       #    just packaged above (provision localDist ← build/dist), so nothing new is committed.
       #    The co-link check below consumes the owner as an in-build `project(":boringssl-canonical")`
       #    dependency (NOT this mavenLocal publish), so this step stands on its own as a publish smoke.
-      #    Publish ONLY the linuxX64 (+ root kotlinMultiplatform) publications — NOT the aggregate
-      #    `publishToMavenLocal`, which would also drive the linuxArm64 publication and cross-build the
-      #    arm64 BoringSSL archive (buildx + qemu) on this amd64 runner, which provisions neither.
+      #    Publish ONLY the linuxX64 target publication. NOT the root `kotlinMultiplatform` publication
+      #    (nor the aggregate `publishToMavenLocal`): its metadata (commonizeCInterop → allMetadataJar)
+      #    transitively needs the linuxArm64 cinterop klib → generateCanonicalDefLinuxArm64 →
+      #    :boringssl-build:buildBoringSslArchivesLinuxArm64, i.e. an arm64 BoringSSL docker cross-build.
+      #    This runner is a NATIVE amd64 box with NO qemu/buildx (the arm64 leg builds natively on an
+      #    arm64 runner precisely so no emulation is ever provisioned), so that cross-build fails hard
+      #    (`exec /bin/sh: exec format error`). The linuxX64 target publication alone still emits the
+      #    embedded-archive `-cinterop` klib + its GMM `.module` — everything this smoke needs to prove.
+      #    The root `kotlinMultiplatform`/metadata publication (which needs BOTH per-triple archives) is
+      #    a release-job concern: when merged.yaml wires canonical -> Central it must assemble both the
+      #    linuxX64 and linuxArm64 archives first (e.g. a native arm64 build leg, or qemu/buildx) before
+      #    publishing the aggregate. It is deliberately out of scope for this per-triple PR smoke.
       - name: "Build + publish-smoke :boringssl-canonical owner (mavenLocal) (${{ matrix.triple }})"
         if: ${{ matrix.triple == 'linuxX64' }}
         run: |
           ARGS=""
           [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
           ./gradlew \
-            :boringssl-canonical:publishKotlinMultiplatformPublicationToMavenLocal \
             :boringssl-canonical:publishLinuxX64PublicationToMavenLocal \
             $ARGS --stacktrace
 
