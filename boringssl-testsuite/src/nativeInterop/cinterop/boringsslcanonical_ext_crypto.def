@@ -1,0 +1,41 @@
+package = com.ditchoom.boringssl.canonical.ext.crypto
+headers = openssl/sha.h openssl/curve25519.h openssl/hkdf.h openssl/digest.h
+# glibc 2.19 (K/N linuxX64 floor) keeps pthread + dl in separate libs. The final binary needs them
+# regardless of which module owns the archive.
+linkerOpts = -lpthread -ldl
+
+# EXTERNAL (embedArchive=false) surface: headers ONLY — NO libraryPaths / staticLibraries. This
+# cinterop embeds NO archive; its SHA256/X25519/HKDF refs resolve at final link against the single
+# canonical archive embedded by the :boringssl-canonical OWNER klib (the one-copy co-link proof). A
+# distinct package + distinct wrapper name keeps it from colliding with the full-bundle/cryptoOnly
+# smoke cinterops in the same linuxX64 compilation.
+
+---
+
+#include <openssl/sha.h>
+#include <openssl/curve25519.h>
+#include <openssl/hkdf.h>
+#include <openssl/digest.h>
+#include <stddef.h>
+
+// Buffer's crypto-closure probe (SHA256 + X25519 + HKDF), reused from boringsslsmoke_cryptoonly.def,
+// but resolved through the co-linked OWNER archive rather than an embedded one. Writes SHA256(data,len)
+// into out32 and returns 1 only if X25519 + HKDF also succeed; deterministic inputs (no RNG).
+static inline int canon_ext_crypto_probe(const unsigned char *data, size_t len,
+                                         unsigned char *out32) {
+    SHA256(data, len, out32);
+
+    static const unsigned char priv[32] = {1};
+    static const unsigned char basepoint[32] = {9};
+    unsigned char shared[32];
+    if (X25519(shared, priv, basepoint) != 1) return 0;
+
+    static const unsigned char secret[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    static const unsigned char salt[4] = {8, 9, 10, 11};
+    static const unsigned char info[3] = {12, 13, 14};
+    unsigned char okm[16];
+    if (HKDF(okm, sizeof(okm), EVP_sha256(),
+             secret, sizeof(secret), salt, sizeof(salt), info, sizeof(info)) != 1) return 0;
+
+    return 1;
+}

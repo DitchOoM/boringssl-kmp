@@ -1,0 +1,21 @@
+package = com.ditchoom.boringssl.canonical.ext.ssl
+headers = openssl/ssl.h openssl/base.h
+linkerOpts = -lpthread -ldl
+
+# EXTERNAL (embedArchive=false) libssl surface: headers ONLY — NO libraryPaths / staticLibraries. The
+# SSL_CTX_new / TLS_method / SSL_CTX_free refs resolve at final link against the single libssl.a the
+# :boringssl-canonical OWNER klib embeds. This is the second co-linking surface of the one-copy
+# tripwire: a full owner serves BOTH a crypto-closure consumer AND a libssl consumer from one archive.
+
+---
+
+#include <openssl/ssl.h>
+
+// Prove the co-linked owner archive satisfies a real libssl entry point. Returns 1 iff a TLS context
+// constructs (and frees) cleanly.
+static inline int canon_ext_ssl_ctx_new_ok(void) {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_method());
+    if (ctx == NULL) return 0;
+    SSL_CTX_free(ctx);
+    return 1;
+}

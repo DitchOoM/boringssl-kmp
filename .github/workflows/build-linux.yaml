@@ -89,13 +89,39 @@ jobs:
           [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
           ./gradlew :boringssl-build:${{ matrix.task }} $ARGS --stacktrace
 
-      # ── Testsuite link-smoke + surface-contract KAT batteries (Profile 1 standing gate): statically
-      #    link the just-built archives into K/N linuxX64 test binaries — the full-bundle SHA256 smoke
-      #    (libssl.a + libcrypto.a) AND the libcrypto.a-ALONE cryptoOnly gate with RFC/NIST KATs over
-      #    buffer's frozen crypto closure (HMAC, AES-GCM, ChaCha20-Poly1305, Ed25519, X25519,
-      #    ECDSA/ECDH P-256, SHA-384/512, RAND). Only the x64 leg: K/N has no linux-aarch64 host
-      #    target, so the arm64 runner cannot compile or run a K/N test binary.
-      - name: "Testsuite link-smoke + KAT batteries (${{ matrix.triple }})"
+      # ── Bindings-free ingredient owner (RFC §12 D10): build + publish-smoke :boringssl-canonical to
+      #    mavenLocal — proves the owner PUBLISHES cleanly and emits its embedded-archive `-cinterop`
+      #    klib via Gradle Module Metadata (the archive rides the `.module`, NOT the POM). The owner
+      #    ships ONLY the ONE canonical archive (embedArchive=true), an EMPTY bindings-free interop
+      #    surface — "ship the ingredients, not the bindings". It embeds the SAME container-built archive
+      #    just packaged above (provision localDist ← build/dist), so nothing new is committed.
+      #    The co-link check below consumes the owner as an in-build `project(":boringssl-canonical")`
+      #    dependency (NOT this mavenLocal publish), so this step stands on its own as a publish smoke.
+      #    Publish ONLY the linuxX64 (+ root kotlinMultiplatform) publications — NOT the aggregate
+      #    `publishToMavenLocal`, which would also drive the linuxArm64 publication and cross-build the
+      #    arm64 BoringSSL archive (buildx + qemu) on this amd64 runner, which provisions neither.
+      - name: "Build + publish-smoke :boringssl-canonical owner (mavenLocal) (${{ matrix.triple }})"
+        if: ${{ matrix.triple == 'linuxX64' }}
+        run: |
+          ARGS=""
+          [ -n "${{ inputs.bundle_version }}" ] && ARGS="-PboringsslBundleVersion=${{ inputs.bundle_version }}"
+          ./gradlew \
+            :boringssl-canonical:publishKotlinMultiplatformPublicationToMavenLocal \
+            :boringssl-canonical:publishLinuxX64PublicationToMavenLocal \
+            $ARGS --stacktrace
+
+      # ── Testsuite link-smoke + surface-contract KAT batteries + D10 co-link check (Profile 1 + D10
+      #    standing gates): statically link the just-built archives into K/N linuxX64 test binaries —
+      #    the full-bundle SHA256 smoke (libssl.a + libcrypto.a) AND the libcrypto.a-ALONE cryptoOnly
+      #    gate with RFC/NIST KATs over buffer's frozen crypto closure (HMAC, AES-GCM, ChaCha20-Poly1305,
+      #    Ed25519, X25519, ECDSA/ECDH P-256, SHA-384/512, RAND) — AND the D10 co-link check: a consumer
+      #    depending on the :boringssl-canonical owner (embedArchive=true, in-build project dep) PLUS its
+      #    own external cinterops (embedArchive=false) co-links into ONE binary that BUILDS + RUNS,
+      #    proving headers-only external surfaces resolve + execute against the co-linked owner archive
+      #    (libssl included). The single-copy invariant itself is enforced at ARCHIVE level by
+      #    validate-artifacts check 8 (nm over libcrypto.a/libssl.a). Only the x64 leg: K/N has no
+      #    linux-aarch64 host target, so the arm64 runner cannot compile or run a K/N test binary.
+      - name: "Testsuite link-smoke + KAT batteries + co-link one-copy (${{ matrix.triple }})"
         if: ${{ matrix.triple == 'linuxX64' }}
         run: ./gradlew :boringssl-testsuite:linuxX64Test --stacktrace
 
