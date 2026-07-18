@@ -32,11 +32,19 @@ ships **checksum-pinned prebuilt bundles**. A thin published Gradle **provision 
 and verifies them into consumer builds. **Consumers keep their own binding `.def`/glue** — we ship
 the ingredients, not the bindings (see §4).
 
-Rejected alternative: publishing cinterop klibs that embed `staticLibraries`. Its "single copy is
-structurally guaranteed by Gradle dedup" claim is **false across the quiche boundary** — dedup only
-covers the `boringssl-kmp` subgraph, so a binary linking `socket-quic-quiche` (its own boring-crate
-BoringSSL) **plus** a boringssl-kmp klib gets two `libcrypto`s. Single-copy is therefore enforced by
-**grep + `nm` + linux-first link ordering**, not asserted structurally.
+Rejected alternative: publishing cinterop klibs that embed **`staticLibraries` *and bindings***. Its
+"single copy is structurally guaranteed by Gradle dedup" claim is **false across the quiche boundary**
+— dedup only covers the `boringssl-kmp` subgraph, so a binary linking `socket-quic-quiche` (its own
+boring-crate BoringSSL) **plus** a boringssl-kmp klib gets two `libcrypto`s. Single-copy is therefore
+enforced by **grep + `nm` + linux-first link ordering**, not asserted structurally.
+
+What is *not* rejected — and is the **sanctioned exception** (D10) — is a **bindings-free** owner klib
+(`:boringssl-canonical`): it embeds the archive behind an **empty** interop surface, ships **no**
+bindings (every consumer still keeps its own `.def`/glue, so "not a klib library" holds), and does
+**not** lean on Gradle dedup for correctness. It is the one deliberate *owner* of the archive on linux;
+all co-linking consumers use **external-mode** cinterops (archive omitted), and the same `nm` +
+link-ordering gate still guards single-copy. quiche whole-archives the **same catalog pin**, so on
+linux the owner *is* the single unprefixed copy (D3). See §12 **D10**.
 
 ## 3. Repo shape
 
@@ -51,8 +59,9 @@ a binary-producing repo.
 | `:boringssl-provision` | Gradle plugin | **Central + Plugin Portal** | `id("com.ditchoom.boringssl.provision")`. Downloads + sha256-verifies tarballs into `~/.gradle/caches/ditchoom-boringssl/<ver>/<triple>/`; exposes `boringsslDir(triple) → {include, lib}`. **The entire native-consumer surface.** |
 | `:boringssl-jvm` | FFM producer | **Central** | Multi-release JAR; shared `libboringsslffi.{so,dylib}` under `META-INF/native/<os>-<arch>/`; **jextract-generated FFM bindings** (§4). |
 | `:boringssl-android` | AAR producer | **Central** | Prefab AAR: static `.a` + headers per ABI (for consumer JNI shims to link). |
+| `:boringssl-canonical` | K/N klib (ingredient, bindings-free) | **Central** | The sanctioned owner klib (D10): a `linuxX64`+`linuxArm64` klib that EMBEDS the ONE canonical archive (`embedArchive=true`) behind an EMPTY, header-less interop surface — ships the ingredient, NOT bindings. Always-present owner so any subset of co-linking consumers (external cinterops) links exactly **one** `libcrypto`/`libssl` copy. **Linux only** — never Apple (D2: CryptoKit/nw + quiche's self-contained force-load; an owner there would collide). |
 | `:boringssl-bom` | BOM | **Central** | Pins all coordinates + records the canonical commit and its quiche ABI anchor. |
-| `:boringssl-testsuite` | validation | — | Per-target link-smoke (SHA256 / AEAD / `SSL_CTX` / `DTLSv1`); wired into `validate-artifacts`. |
+| `:boringssl-testsuite` | validation | — | Per-target link-smoke (SHA256 / AEAD / `SSL_CTX` / `DTLSv1`) + the D10 co-link **one-copy** assertion; wired into `validate-artifacts`. |
 
 **Channel split (decisive):** heavy static tarballs → **GitHub Releases** (unmetered for public
 repos, don't count toward repo size, ≤ a few MB each). Only small artifacts (plugin, FFM JAR, AAR,
@@ -388,3 +397,33 @@ Two caveats carried by this pin:
 
    `0.0.1` (packaging semver, commit in provenance) is correct under this scheme as-is; **D9 shapes
    `0.0.2+`** and the multi-version future. Ratify alongside D8.
+10. **D10 — sanctioned bindings-free ingredient owner klib: ✅ RATIFIED (validated on alien1).** "Not a
+   klib library" (§2) bars shipping crypto **BINDINGS** as klibs — every consumer needs its own
+   `.def`/glue and must not inherit ours. It does **not** bar shipping the **ingredient**. `:boringssl-
+   canonical` is a `linuxX64`+`linuxArm64` K/N klib that **embeds the ONE canonical archive**
+   (`embedArchive=true` on the provision-plugin cinterop) behind a **header-less, wrapper-free** interop
+   surface (a trivial `package = …canonical` def, `---`, nothing else) — it exposes **zero** BoringSSL
+   bindings. Its sole job is to be the **always-present owner** of the archive so that any subset of
+   co-linking K/N consumers (`buffer` + `socket` + `webrtc-dtls`, each with its own **external-mode**
+   cinterop, `embedArchive=false`) resolves to **exactly one** `libcrypto`/`libssl` copy.
+   - **Cross-ref D3 (single unprefixed copy).** The owner **is** that one unprefixed copy on linux; quiche
+     whole-archives the **same catalog pin** (§6), so quiche's copy and the owner's copy are the same
+     commit and dedup/force-load to one. D10 does not weaken D3 — it *implements* it as a concrete module
+     instead of relying on each consumer to embed. The `validate-artifacts` `nm` single-copy guard (checks
+     4/5/8) and the runtime co-link one-copy assertion (`:boringssl-testsuite:linuxX64Test`) are the
+     tripwires; the `--gc-sections` result on alien1 showed a buffer-only consumer of the FULL owner is
+     **byte-identical** to a direct cryptoOnly build (zero size penalty), so ONE full-bundle owner serves
+     every consumer subset.
+   - **Ownership stays at the project level.** The owner lives in `boringssl-kmp` and is depended on
+     externally; BoringSSL ownership is **not** leaked into `buffer`/`socket` (they own no archive — they
+     bind external-mode against the owner's single copy).
+   - **Linux only, never Apple.** On Apple (D2) `buffer` uses CryptoKit/CommonCrypto and the network stack
+     uses `nw`/quiche's self-contained force-loaded copy; a second unprefixed owner there would collide, so
+     `:boringssl-canonical` targets `linuxX64`+`linuxArm64` **only**.
+   - **Distribution seam.** The embedded archive rides a **separate `-cinterop` klib artifact** published
+     via **Gradle Module Metadata** (`.module`), not the POM — so Module Metadata is **mandatory** for this
+     coordinate. `boringsslDir()` runs `tar` at **configuration** time (a config-cache seam to harden or
+     document). CI embeds the archive at **build** time (provision `localDist` ← `:boringssl-build`'s
+     `build/dist`, same as `:boringssl-testsuite`) — **nothing binary is committed** (directive #1).
+   - **Composes with D8.** When >1 commit coexists, each distinct commit gets its own content-addressed
+     owner variant; the unprefixed owner remains the canonical single copy quiche shares.

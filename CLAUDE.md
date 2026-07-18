@@ -9,7 +9,11 @@ single-pinned BoringSSL** across every platform `buffer`/`socket`/`webrtc-dtls` 
 consumers stop each building their own. It is **not** a klib library: it cross-compiles one pinned
 commit across the matrix once per commit in CI, ships **checksum-pinned prebuilt bundles**, and a thin
 published Gradle **provision plugin** downloads + verifies them into consumer builds. Consumers keep
-their own binding `.def`/glue — we ship the ingredients, not the bindings.
+their own binding `.def`/glue — we ship the ingredients, not the bindings. The **one sanctioned klib**
+(`:boringssl-canonical`, RFC §12 **D10**) is the *ingredient*, not a binding: a bindings-free K/N owner
+klib that embeds the ONE canonical archive behind an empty interop surface so co-linking consumers
+resolve to a single `libcrypto` copy (linux only). It ships zero BoringSSL bindings — the "not a klib
+library" bar is on BINDINGS klibs, which still stands.
 
 **Read first, fully:**
 1. `RFC_BORINGSSL_KMP.md` — the plan of record (the *what* and *why*). §3 (repo shape), §5 (Android
@@ -67,8 +71,9 @@ boringssl-build       plain Gradle: per-triple cmake + packaging → GitHub Rele
 boringssl-provision   Gradle plugin: download + sha256-verify tarballs; boringsslDir(triple)  → Central + Plugin Portal
 boringssl-jvm         FFM producer: MRJAR (shared lib + jextract bindings)                     → Central
 boringssl-android     AAR producer: prefab (static .a + headers per ABI: arm64-v8a, x86_64)    → Central
+boringssl-canonical   K/N owner klib: embeds the ONE archive, bindings-free (D10); linuxX64+linuxArm64 → Central
 boringssl-bom         BOM: pins coordinates + records canonical commit / quiche anchor          → Central
-boringssl-testsuite   per-target link-smoke validation (apiCheck-excluded)                      [not published]
+boringssl-testsuite   per-target link-smoke + D10 co-link one-copy assertion (apiCheck-excluded) [not published]
 ```
 
 ## Build logic — the convention plugin (no copy-paste)
@@ -79,9 +84,10 @@ matrix (RFC §7, 12 triples), the JDK-21 toolchain, Android (minSdk 24 per D7), 
 kover, binary-compatibility validation (JVM dump only), Maven Central publishing, signing, and version
 derivation. It is the webrtc convention **trimmed**: js/wasm, kotlinx-benchmark, allopen, and KSP are
 dropped. `:boringssl-build` (plain Gradle), `:boringssl-provision` (Gradle plugin), `:boringssl-bom`
-(java-platform), and `:boringssl-android` (hand-rolled `maven-publish` prefab-AAR producer — a prefab
-AAR carries no Kotlin, and AGP's KMP-library DSL has no prefab-publishing surface) deliberately do NOT
-apply it.
+(java-platform), `:boringssl-android` (hand-rolled `maven-publish` prefab-AAR producer — a prefab
+AAR carries no Kotlin, and AGP's KMP-library DSL has no prefab-publishing surface), and
+`:boringssl-canonical` (the D10 owner klib — the convention registers jvm/android/apple targets the
+bindings-free linux-only owner must NOT have) deliberately do NOT apply it.
 
 A module's own `build.gradle.kts` carries only its dependencies/specifics; per-module POM prose lives
 in `<module>/gradle.properties` (`POM_NAME`, `POM_DESCRIPTION`); shared POM/developer/license fields
@@ -102,6 +108,10 @@ are in the root `gradle.properties`. Plugin versions are declared once in `gradl
 - **PR** (`review.yaml`): grep-gate (binary-repo directives) → `build-linux` + `build-apple` +
   `build-android` → `validate-artifacts` (binary-shaped: tarball extracts, headers present, `nm` shows
   unprefixed symbols + exactly one `libcrypto`, wrapper-`.def` compile+link per triple, FFM
-  `SymbolLookup`, AAR prefab metadata, quiche `ffi,qlog` link-smoke, per-ABI size vs the §5 budget).
+  `SymbolLookup`, AAR prefab metadata, quiche `ffi,qlog` link-smoke, per-ABI size vs the §5 budget,
+  the D10 single-copy set-membership + provenance⇄catalog pin-alignment guards).
+- **`build-linux`'s linuxX64 leg** publishes `:boringssl-canonical` to mavenLocal, then runs
+  `:boringssl-testsuite:linuxX64Test` — the standing gates: full/cryptoOnly link-smokes, the crypto-closure
+  KAT battery, AND the **D10 co-link one-copy** assertion (owner + external cinterop → one `libcrypto`).
 - **Release** (`merged.yaml`): label-driven version bump → build → validate → publish (small artifacts
   to Central + Plugin Portal; tarballs to GitHub Releases) → tag + release. Both are **stubs** today.
