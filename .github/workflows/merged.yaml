@@ -171,6 +171,40 @@ jobs:
           restore-keys: |
             bssl-android-
 
+      # ── Restore BOTH linux BoringSSL archives (+ their real build markers) so :boringssl-canonical can
+      #    EMBED libssl.a/libcrypto.a into its per-triple cinterop klibs at publish time WITHOUT a docker
+      #    rebuild. Each triple's archives were built + cached by its NATIVE-arch build-linux leg under
+      #    bssl-libs-<triple>-* (arm64 builds on a native arm64 runner — no qemu). With the real markers
+      #    present, buildBoringSslArchives{LinuxX64,LinuxArm64} short-circuit and the linuxArm64 cinterop
+      #    klib cross-compiles from this x64 host. This is the sanctioned fix for the PR #19 arm64-drag:
+      #    the KMP-root/metadata publication needs BOTH cinterop klibs, so both archives must be here.
+      - name: Restore linuxX64 BoringSSL archives (for :boringssl-canonical embed)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            boringssl-build/libs/boringssl/linuxX64
+            boringssl-build/libs/boringssl/linuxX64-*
+          key: bssl-libs-linuxX64-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map', 'boringssl-build/scripts/build-prefixed-variant.sh', 'boringssl-build/patches/**') }}
+          restore-keys: |
+            bssl-libs-linuxX64-
+      - name: Restore linuxArm64 BoringSSL archives (for :boringssl-canonical embed)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            boringssl-build/libs/boringssl/linuxArm64
+            boringssl-build/libs/boringssl/linuxArm64-*
+          key: bssl-libs-linuxArm64-${{ hashFiles('gradle/libs.versions.toml', 'boringssl-build/docker/Dockerfile', 'boringssl-build/docker/build-archives.sh', 'boringssl-build/docker/link-ffi.sh', 'boringssl-build/docker/boringssl_shim.h', 'boringssl-build/docker/boringssl_shim.c', 'boringssl-build/docker/boringssl_ffi_exports.map', 'boringssl-build/scripts/build-prefixed-variant.sh', 'boringssl-build/patches/**') }}
+          restore-keys: |
+            bssl-libs-linuxArm64-
+      # x64 host toolchain (linuxArm64 cross-target prebuilts download on demand if absent).
+      - name: Restore Kotlin/Native toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.konan
+          key: konan-amd64-${{ hashFiles('gradle/libs.versions.toml') }}
+          restore-keys: |
+            konan-amd64-
+
       - name: Stage FFM shared libs into the MRJAR layout + assemble SHA256SUMS
         run: |
           set -euo pipefail
@@ -184,6 +218,19 @@ jobs:
           done
           ( cd dist && sha256sum boringssl-*.tar.gz | sort -k2 > SHA256SUMS && cat SHA256SUMS )
 
+      # Guard: :boringssl-canonical embeds these at publish time. If the caches missed, FAIL LOUDLY here
+      # rather than letting buildBoringSslArchives<cap> attempt a docker (cross-)build on this x64 runner.
+      - name: Assert both linux archives restored (for :boringssl-canonical)
+        run: |
+          set -euo pipefail
+          for t in linuxX64 linuxArm64; do
+            for a in libcrypto.a libssl.a; do
+              f="boringssl-build/libs/boringssl/$t/lib/$a"
+              [ -f "$f" ] || { echo "MISSING $f — bssl-libs-$t cache did not restore; canonical publish would trigger a docker build."; exit 1; }
+            done
+          done
+          echo "Both linux archives present (linuxX64 + linuxArm64) — canonical can embed without a rebuild."
+
       - name: Publish all modules to the local maven repo (UNSIGNED)
         env:
           V: ${{ needs.plan.outputs.version }}
@@ -194,11 +241,14 @@ jobs:
           # (directive #4). NB: it MUST be the same invocation as publishToMavenLocal — a separate bake
           # run would be re-run without the file here and clobber the resource back to version-only.
           # boringssl-jvm is JVM-only (boringsslNativeTargets=false) so no native-klib prebuild is needed.
+          # :boringssl-canonical publishes the KMP-root (kotlinMultiplatform) + linuxX64 + linuxArm64
+          # publications; its per-triple cinterop klibs embed the restored archives (owner klib, D3/D10).
           ./gradlew \
             :boringssl-bom:publishToMavenLocal \
             :boringssl-jvm:publishToMavenLocal \
             :boringssl-android:publishToMavenLocal \
             :boringssl-provision:publishToMavenLocal \
+            :boringssl-canonical:publishToMavenLocal \
             -Pversion="$V" -PchecksumsFile="$PWD/dist/SHA256SUMS" \
             --no-configuration-cache --stacktrace
 
