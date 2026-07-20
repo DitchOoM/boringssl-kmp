@@ -308,7 +308,10 @@ jobs:
           set -euo pipefail
           ( cd dist && sha256sum boringssl-*.tar.gz | sort -k2 > SHA256SUMS && cat SHA256SUMS )
           echo "commit=$(grep -E '^boringssl = ' gradle/libs.versions.toml | grep -oE '[0-9a-f]{40}')" >> "$GITHUB_OUTPUT"
-          echo "quiche=$(grep -E '^boringsslQuicheAbi = ' gradle/libs.versions.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+          # Extract on its own line so cut gets a real single-char '"' delimiter — inside echo "$(…)"
+          # the '\"' YAML-literal became a two-char delimiter, so cut errored and the anchor rendered ****.
+          quiche=$(grep -E '^boringsslQuicheAbi = ' gradle/libs.versions.toml | cut -d'"' -f2)
+          echo "quiche=$quiche" >> "$GITHUB_OUTPUT"
 
       - name: Create tag (release flow only)
         if: needs.plan.outputs.flow == 'release'
