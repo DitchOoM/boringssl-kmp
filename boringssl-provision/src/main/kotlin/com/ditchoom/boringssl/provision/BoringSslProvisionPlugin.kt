@@ -5,7 +5,11 @@ import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import java.io.File
+import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.URI
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 
 /**
@@ -306,12 +310,85 @@ open class BoringSslProvisionExtension(private val project: Project) {
             val cached = File(cacheRoot, "downloads/$tarName")
             if (!cached.exists()) {
                 cached.parentFile.mkdirs()
-                val url = "$baseUrl$version/$tarName"
-                project.logger.lifecycle("Downloading BoringSSL bundle: $url")
-                URI(url).toURL().openStream().use { input -> cached.outputStream().use { input.copyTo(it) } }
+                download("$baseUrl$version/$tarName", cached)
             }
             cached
         }
+    }
+
+    /**
+     * Fetch [url] into [dest] — atomically, with timeouts, and with a bounded retry.
+     *
+     * Three things a bare `URL.openStream().copyTo(...)` did not do, each answering a way the release
+     * lanes actually broke:
+     *
+     * 1. **Retry.** The observed failure is `Unexpected end of file from server` — `HttpClient`'s words
+     *    for a connection closed before the response completed, classically a pooled keep-alive socket
+     *    the far end had already dropped. A single attempt turned that into a build failure, and four
+     *    consecutive release runs died on it while the asset itself was healthy. `Connection: close`
+     *    asks for a fresh socket per attempt, so a retry is not handed the same dead one back.
+     * 2. **Timeouts.** `openStream()` sets none, so the failure mode opposite to an EOF — a server that
+     *    accepts the connection and then never speaks — hangs the job until CI's own timeout kills it,
+     *    with no retry and nothing in the log naming the URL.
+     * 3. **Atomicity.** The old copy wrote straight to the cache path, so an interrupted download left a
+     *    TRUNCATED file sitting there. The next invocation sees it exists, skips the fetch entirely, and
+     *    fails the sha256 check instead — surfacing as a checksum mismatch, which reads as corruption or
+     *    tampering rather than as a partial download, and which no amount of retrying clears until
+     *    somebody deletes the cache by hand. Downloading beside the target and moving it into place on
+     *    success means a partial is never visible as a cache hit.
+     */
+    private fun download(
+        url: String,
+        dest: File,
+    ) {
+        var lastFailure: IOException? = null
+        repeat(DOWNLOAD_ATTEMPTS) { attempt ->
+            project.logger.lifecycle(
+                "Downloading BoringSSL bundle (attempt ${attempt + 1}/$DOWNLOAD_ATTEMPTS): $url",
+            )
+            // Unique per attempt, so two Gradle invocations racing the same cache cannot truncate each
+            // other's in-flight body — a collision the single fixed path could not rule out either.
+            val partial = File.createTempFile("${dest.name}.", ".part", dest.parentFile)
+            try {
+                val connection =
+                    (URI(url).toURL().openConnection() as HttpURLConnection).apply {
+                        connectTimeout = CONNECT_TIMEOUT_MS
+                        readTimeout = READ_TIMEOUT_MS
+                        setRequestProperty("Connection", "close")
+                    }
+                try {
+                    val copied =
+                        connection.inputStream.use { input -> partial.outputStream().use { input.copyTo(it) } }
+                    // `copyTo` reads to EOF and cannot tell "the body ended" from "the connection did",
+                    // so a body cut short arrives as a SHORT FILE with no exception at all. Left
+                    // unchecked that reaches the caller as a sha256 mismatch — a message that reads as
+                    // corruption or tampering and sends the reader to the release asset, when the asset
+                    // was fine and the transfer was not. Compared only when the length is both declared
+                    // and describes the bytes we actually receive (a re-encoded body would not).
+                    val declared = connection.contentLengthLong
+                    if (connection.contentEncoding == null && declared >= 0 && copied != declared) {
+                        throw IOException("truncated response: read $copied of $declared declared bytes")
+                    }
+                } finally {
+                    connection.disconnect()
+                }
+                // Only now, with the whole body read, does the cache path come into existence.
+                Files.move(partial.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                return
+            } catch (e: IOException) {
+                lastFailure = e
+                partial.delete()
+                project.logger.warn(
+                    "boringssl: download attempt ${attempt + 1}/$DOWNLOAD_ATTEMPTS failed for $url: $e",
+                )
+                if (attempt < DOWNLOAD_ATTEMPTS - 1) Thread.sleep(RETRY_BACKOFF_MS * (attempt + 1L))
+            }
+        }
+        throw GradleException(
+            "BoringSSL bundle download failed after $DOWNLOAD_ATTEMPTS attempts: $url " +
+                "(last failure: $lastFailure)",
+            lastFailure,
+        )
     }
 
     private fun sha256(f: File): String {
@@ -321,5 +398,21 @@ open class BoringSslProvisionExtension(private val project: Project) {
             while (true) { val r = ins.read(buf); if (r < 0) break; md.update(buf, 0, r) }
         }
         return md.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private companion object {
+        /** Attempts per bundle URL. Three covers a stale pooled socket and a blip; a wall beyond that. */
+        const val DOWNLOAD_ATTEMPTS = 3
+
+        const val CONNECT_TIMEOUT_MS = 15_000
+
+        /**
+         * Generous against a slow runner but finite: the bundle is ~1.8 MB, so a read that stalls this
+         * long is a hung connection, not a slow one, and retrying beats waiting for the job timeout.
+         */
+        const val READ_TIMEOUT_MS = 60_000
+
+        /** Multiplied by the attempt number — 0.5s then 1s, enough for a transient to clear. */
+        const val RETRY_BACKOFF_MS = 500L
     }
 }
