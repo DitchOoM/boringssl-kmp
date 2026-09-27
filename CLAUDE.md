@@ -23,8 +23,8 @@ Current state: **migration step 1** (RFC §10) — the repo structure stands up 
 template, re-pointed for a binary-producing repo, and **configures cleanly** (`./gradlew projects`).
 The real BoringSSL cmake cross-compile is **step 2** and is deliberately **stubbed** (see below).
 
-**Canonical pin:** the `boringssl` version in `gradle/libs.versions.toml` (BoringSSL API 21, the tree
-`boring-sys 4.22.0` vendors for quiche 0.29.2). That catalog entry is the **single 40-hex commit
+**Canonical pin:** the `boringssl` version in `gradle/libs.versions.toml` (BoringSSL API 41, the tree
+`boring-sys 5.2.0` vendors for quiche 0.30.0). That catalog entry is the **single 40-hex commit
 literal in the whole tree** — everything else reads it from the catalog. The pin **follows quiche**
 going forward.
 
@@ -36,13 +36,13 @@ review gate:
 1. **No committed binaries.** No `.a`/`.so`/`.dylib`/tarball is ever committed; `libs/**` is gitignored
    and built in CI. Bundles ship via **GitHub Releases** (not LFS, not Packages, not Central).
 2. **Exactly ONE `boringssl` commit literal in the tree** — the catalog entry
-   `boringssl = 44b3df6f…`. Every task/BOM/plugin reads the commit from the catalog; no second copy.
+   `boringssl = e2a57cfb…`. Every task/BOM/plugin reads the commit from the catalog; no second copy.
 3. **No `BORINGSSL_PREFIX`** unless a catalog flag opts in (the one-unprefixed-copy invariant, D3).
    Single unprefixed copy forever; the `validate-artifacts` `nm` single-copy guard is the tripwire.
 4. **Every artifact carries a sha256 + provenance.** Checksums are baked into the provision plugin
    (no TOFU); `.sha256` + `SHA256SUMS` + `provenance.json` accompany each tarball.
 5. **Release notes state the canonical commit + quiche ABI anchor**
-   (`boringsslQuicheAbi = "quiche 0.29.2 / boring-sys 4.22.0"`).
+   (`boringsslQuicheAbi = "quiche 0.30.0 / boring-sys 5.2.0"`).
 6. **The PR description states which platform lanes were runtime-validated vs compile-faithful**
    (Apple/tvOS/watchOS are only real on the macOS runner; kept from webrtc's CLAUDE.md).
 

@@ -16,11 +16,12 @@ binaryCompatibilityValidator = "0.18.1"
 
 # ── Canonical BoringSSL pin (RFC §10 / §12 D1) ────────────────────────────────────────────────────
 # The ONE 40-hex commit literal permitted anywhere in this tree (the single-pin directive, RFC §8).
-# google/boringssl @ BORINGSSL_API_VERSION 21 (2023-05-08) — the exact tree boring/boring-sys 4.22.0
-# vendors, which is quiche 0.29.2's TLS backend. The canonical pin FOLLOWS the quiche release.
-boringssl = "44b3df6f03d85c901767250329c571db405122d5"
-boringsslApiVersion = "21"
-boringsslQuicheAbi = "quiche 0.29.2 / boring-sys 4.22.0"
+# google/boringssl @ BORINGSSL_API_VERSION 41 (2026-05-27) — the exact tree boring/boring-sys 5.2.0
+# vendors (its `boring-sys/deps/boringssl` gitlink), which is quiche 0.30.0's TLS backend. The
+# canonical pin FOLLOWS the quiche release.
+boringssl = "e2a57cfb4d915b4ba820585aef9fdee7bca13fe5"
+boringsslApiVersion = "41"
+boringsslQuicheAbi = "quiche 0.30.0 / boring-sys 5.2.0"
 # Android native floor: the ANDROID_PLATFORM the per-ABI static .a target. MUST match the convention
 # plugin's `minSdk` (24, RFC §5 Rule D / D7). Single source so the native cross-compile and the KMP
 # Android target can never drift apart.

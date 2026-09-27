@@ -31,8 +31,11 @@ OUT="/work/boringssl-build/libs/boringssl/${TRIPLE}"
 
 echo "== cmake configure ($TRIPLE, CFLAGS=$CFLAGS) =="
 rm -rf "$BUILD"; mkdir -p "$BUILD"; cd "$BUILD"
+# BUILD_TESTING=OFF: BoringSSL's include(CTest) defaults it ON, which configures googletest + Google
+# benchmark (whose regex feature probes fail when cross-compiling). Only `ssl crypto` are built.
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DBUILD_SHARED_LIBS=OFF \
+      -DBUILD_TESTING=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
       -DCMAKE_C_FLAGS="$CFLAGS" \
       -DCMAKE_CXX_FLAGS="$CFLAGS" \

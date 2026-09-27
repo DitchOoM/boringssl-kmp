@@ -234,7 +234,12 @@ every artifact carries sha256 + provenance; release notes state the canonical co
 
 ## 10. Migration (ordered; reconciles the commits; breaks no release)
 
-**Canonical pin = `44b3df6f03d85c901767250329c571db405122d5`** — RESOLVED, see §12/D1. This is
+**Current canonical pin = `e2a57cfb`** (API 41, the tree `boring-sys 5.2.0` vendors for **quiche 0.30.0**;
+full SHA in the catalog). quiche 0.30.0 accepts `boring >=4.19,<6`, so the pin followed quiche onto
+boring 5 — which also brings DTLS 1.3 (D1a) and a **C++-runtime requirement for `libssl.a`** (libcrypto
+stays C++-runtime-free). The rest of this section records the original `44b3df6f` resolution.
+
+**Original canonical pin = `44b3df6f03d85c901767250329c571db405122d5`** — RESOLVED, see §12/D1. This is
 google/boringssl at **`BORINGSSL_API_VERSION 21`** (committed 2023-05-08), the exact tree
 `boring`/`boring-sys 4.22.0` vendors, which is quiche 0.29.2's TLS backend. **Both existing pins were
 wrong for the quiche ABI:** socket's `f1c75347` is API **16**, buffer's `63893acb` is API **42** —
@@ -280,7 +285,8 @@ Two caveats carried by this pin:
 
 ## 12. Decisions (all resolved 2026-07-14)
 
-1. **D1 — quiche ABI anchor (gates everything): ✅ RESOLVED.** socket pins **quiche 0.29.2** →
+1. **D1 — quiche ABI anchor (gates everything): ✅ RESOLVED; moved 2026-09 to quiche 0.30.0 →
+   boring-sys 5.2.0 → `e2a57cfb` (API 41).** Originally: socket pins **quiche 0.29.2** →
    `boring`/`boring-sys` **4.22.0** → google/boringssl **`44b3df6f03d85c901767250329c571db405122d5`**
    (`BORINGSSL_API_VERSION 21`, 2023-05-08) + 3 cloudflare feature patches. **Canonical pin =
    `44b3df6f…`.** Neither old pin matched (f1c75347=API16, 63893acb=API42). Commit follows quiche going forward.
@@ -304,6 +310,10 @@ Two caveats carried by this pin:
      `BORINGSSL_PREFIX` on one (escalates D3) or a guarantee they never co-load.
    - **(3) Fork quiche onto boring 5.x:** unifies everything at API 37 + DTLS 1.3 *and* keeps
      single-copy, at the cost of owning a quiche fork until upstream moves.
+
+   **Superseded 2026-09:** quiche 0.30.0 adopted boring 5.x, the pin followed (`e2a57cfb`, API 41),
+   so the canonical copy now has `DTLS1_3_VERSION` with the single-copy invariant intact — option (1)'s
+   predicted outcome, no fork.
 
    **✅ LOCKED: option (1).** DTLS 1.2 baseline — the WebRTC field floor; media protection is SRTP
    (unaffected by DTLS version), the 1-RTT handshake win is dominated by ICE setup, and browser peers

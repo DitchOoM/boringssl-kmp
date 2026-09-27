@@ -54,6 +54,8 @@ ok "prefab.json ok (schema_version 2, name boringssl)"
 
 # ── 3. modules + per-ABI payload ─────────────────────────────────────────────────────────────────
 declare -A LIBBASE=([crypto]=libcrypto [ssl]=libssl)
+# libcrypto has no C++ runtime refs; libssl is ordinary C++ and declares the libc++ family.
+declare -A STL=([crypto]=none [ssl]=c++_static)
 for m in crypto ssl; do
   mj="$W/prefab/modules/$m/module.json"
   [ -f "$mj" ] || fail "module $m: module.json missing"
@@ -67,12 +69,12 @@ PY
   for abi in "${ABIS[@]}"; do
     d="$W/prefab/modules/$m/libs/android.$abi"
     [ -f "$d/${LIBBASE[$m]}.a" ] || fail "module $m / $abi: ${LIBBASE[$m]}.a missing"
-    python3 - "$d/abi.json" "$abi" "$API" <<'PY' || fail "abi.json invalid ($m/$abi)"
+    python3 - "$d/abi.json" "$abi" "$API" "${STL[$m]}" <<'PY' || fail "abi.json invalid ($m/$abi)"
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["abi"] == sys.argv[2], f"abi={d['abi']}"
 assert d["api"] == int(sys.argv[3]), f"api={d['api']}"
-assert d["static"] is True and d["stl"] == "none", f"static/stl={d}"
+assert d["static"] is True and d["stl"] == sys.argv[4], f"static/stl={d} (want stl={sys.argv[4]})"
 PY
   done
 done
@@ -96,7 +98,7 @@ for abi in "${ABIS[@]}"; do
   "$CLANG" --target="${TRIPLE[$abi]}$API" -fPIC -shared -o "$W/c-$abi.so" "$W/consumer.c" \
      -I "$M/ssl/include" -I "$M/crypto/include" \
      "$M/ssl/libs/android.$abi/libssl.a" "$M/crypto/libs/android.$abi/libcrypto.a" \
-     -Wl,--no-undefined 2>"$W/e-$abi" \
+     -Wl,--no-undefined -lc++_static -lc++abi 2>"$W/e-$abi" \
      || { echo "--- link errors ($abi) ---"; head -10 "$W/e-$abi"; fail "$abi: consumer failed to link against the AAR payload"; }
 done
 ok "consumer NDK-links against the AAR payload (both ABIs, ssl→crypto)"

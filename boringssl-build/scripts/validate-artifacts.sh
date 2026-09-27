@@ -93,6 +93,15 @@ if ! grep -qE '(^| )T (_)?SHA256_Init$' <<<"$crypto_syms"; then
 fi
 ok "static archives export un-mangled (plain) BoringSSL symbols"
 
+# ── libcrypto.a is C++-runtime-free (libssl.a is not) ────────────────────────────────────────────
+# BoringSSL builds libcrypto's C++ with -fno-exceptions -fno-rtti so a crypto-only consumer (buffer's
+# closure, the FFM shim) links with a plain C driver; only libssl needs the C++ runtime. A C++ runtime
+# reference escaping into libcrypto would silently move that requirement onto every consumer.
+crypto_cxx="$(awk 'NF>=2{t=$(NF-1); n=$NF; if(t=="U") u[n]=1; else if(length(t)==1) d[n]=1} END{for(k in u) if(!(k in d)) print k}' <<<"$crypto_syms" \
+  | grep -E '^_?(__cxa_|__gxx_personality|_Unwind_Resume|_Z(dl|nw|da|na)|_ZSt9terminate|_ZTVN10__cxxabiv1)' || true)"
+[ -z "$crypto_cxx" ] || fail "libcrypto.a references the C++ runtime (it must not):"$'\n'"$crypto_cxx"
+ok "libcrypto.a references no C++ runtime symbol (only libssl.a needs it)"
+
 # ── 5. the .so exports ONLY the curated shim; BoringSSL is hidden (D3 single-copy tripwire) ───────
 # Assert the INVARIANT, not a frozen list (the surface grows): every exported text symbol must be a
 # boringssl_ffi_* shim symbol, and there must be at least one. Anything else = a BoringSSL leak.
