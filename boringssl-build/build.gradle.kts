@@ -31,9 +31,9 @@ val boringsslAndroidApi = catalog.findVersion("boringsslAndroidApi").get().requi
 val bundleVersion = (findProperty("boringsslBundleVersion") as String?) ?: "0.0.1-dev"
 
 // Deterministic packaging: pin a fixed epoch so tar/gzip mtimes are stable (RFC §11 reproducibility).
-// 2023-05-08, the canonical commit's date — a stable, meaningful constant (Date.now() is intentionally
-// avoided so re-packaging is bit-stable).
-val sourceDateEpoch = "1683582543"
+// 2026-05-27T07:53:41Z, the canonical commit's committer date — a stable, meaningful constant (Date.now()
+// is intentionally avoided so re-packaging is bit-stable). Moves with the pin.
+val sourceDateEpoch = "1779868421"
 
 // One K/N triple's build recipe. The CANONICAL build runs inside the manylinux2014 (glibc 2.17)
 // container, native-per-arch (amd64 directly / arm64 under qemu) — see docker/. The crossCc/host
@@ -450,7 +450,7 @@ fun registerTriple(t: NativeTriple): Pair<TaskProvider<Task>, TaskProvider<Task>
                     cmakeBuildDir.deleteRecursively(); cmakeBuildDir.mkdirs()
                     val cmakeArgs =
                         mutableListOf(
-                            "cmake", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+                            "cmake", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTING=OFF",
                             "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
                             "-DCMAKE_C_FLAGS=$cFlags", "-DCMAKE_CXX_FLAGS=$cFlags", "-G", "Unix Makefiles",
                         )
@@ -710,6 +710,13 @@ val androidAbis =
 // quiche (TLS+AEAD+HKDF) actually reference — with --gc-sections, strips, and gates the result. At the
 // canonical pin this lands ~1.1 MB/ABI, comfortably under 2.5 MiB.
 val androidAbiBudgetBytes = 2_621_440L // 2.5 MiB (RFC §5)
+
+// libssl.a needs the C++ runtime. BoringSSL builds libcrypto with -fno-exceptions -fno-rtti (no C++
+// runtime refs) but compiles libssl as ordinary C++ (std::optional/variant, operator delete, the
+// exception ABI), the same stance boring-sys 5 / quiche 0.30.0 document ("static C applications must
+// link the C++ runtime"). Every NDK link that pulls libssl names the NDK's static libc++ explicitly,
+// because the C driver (`clang`) links no C++ runtime of its own. libcrypto alone needs none of this.
+val androidCxxRuntime = listOf("-lc++_static", "-lc++abi")
 val androidBudgetProbe =
     """
     #include <openssl/ssl.h>
@@ -805,7 +812,7 @@ fun registerAndroidAbi(a: AndroidAbi): Triple<TaskProvider<Task>, List<TaskProvi
                     "cmake",
                     "-DCMAKE_TOOLCHAIN_FILE=${ndkDir.resolve("build/cmake/android.toolchain.cmake").absolutePath}",
                     "-DANDROID_ABI=${a.abi}", "-DANDROID_PLATFORM=android-$boringsslAndroidApi",
-                    "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+                    "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTING=OFF",
                     "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
                     "-DCMAKE_C_FLAGS=$leanFlags", "-DCMAKE_CXX_FLAGS=$leanFlags",
                     "-G", "Unix Makefiles", srcDir.absolutePath,
@@ -872,7 +879,7 @@ fun registerAndroidAbi(a: AndroidAbi): Triple<TaskProvider<Task>, List<TaskProvi
                     "-I", outDir.resolve("include").absolutePath, probe.absolutePath,
                     "-Wl,--no-undefined",
                     "-Wl,--whole-archive", libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
-                    "-Wl,--no-whole-archive",
+                    "-Wl,--no-whole-archive", *androidCxxRuntime.toTypedArray(),
                     dir = work, what = "android link-smoke ${a.abi}",
                 )
                 // D3: the static archive must export SHA256_Init un-mangled (a prefix build renames it).
@@ -906,7 +913,7 @@ fun registerAndroidAbi(a: AndroidAbi): Triple<TaskProvider<Task>, List<TaskProvi
                     "-fPIC", "-O2", "-ffunction-sections", "-fdata-sections",
                     "-I", outDir.resolve("include").absolutePath, "-shared", "-o", budgetSo.absolutePath,
                     probe.absolutePath, libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
-                    "-Wl,--gc-sections", "-Wl,--no-undefined",
+                    "-Wl,--gc-sections", "-Wl,--no-undefined", *androidCxxRuntime.toTypedArray(),
                     dir = work, what = "android budget link ${a.abi}",
                 )
                 runOrThrow(bin.resolve("llvm-strip").absolutePath, "--strip-unneeded", budgetSo.absolutePath,
@@ -1006,21 +1013,25 @@ data class AppleTriple(
     val proven: Boolean, // false → D4 spike triple (tvOS/watchOS): compile-faithful until proven
 )
 
+// Deployment floors: iOS/tvOS 15.0 and watchOS 8.0 are Kotlin/Native 2.4's own minimums (konan.properties
+// `minVersion.*`), so no K/N consumer can target lower; they are also libc++'s support floor, which now
+// matters because BoringSSL's libcrypto is C++ (libc++ headers in current Xcode SDKs reject older targets
+// under BoringSSL's -Werror). macOS stays 11.0 (libc++'s floor): the FFM dylib serves JVMs, not only K/N.
 val appleTriples =
     listOf(
         // ── macOS — runtime-validated on the macOS runner; the only triples that ship an FFM dylib ──
         AppleTriple("macosX64", "macosx", "x86_64", null, "11.0", "x86_64-apple-macos11.0", "macos-x86_64", true),
         AppleTriple("macosArm64", "macosx", "arm64", null, "11.0", "arm64-apple-macos11.0", "macos-aarch64", true),
         // ── iOS device + simulators — device is compile-faithful; simulators run on the macOS runner ──
-        AppleTriple("iosArm64", "iphoneos", "arm64", "iOS", "12.0", "arm64-apple-ios12.0", null, true),
-        AppleTriple("iosSimulatorArm64", "iphonesimulator", "arm64", "iOS", "12.0", "arm64-apple-ios12.0-simulator", null, true),
-        AppleTriple("iosX64", "iphonesimulator", "x86_64", "iOS", "12.0", "x86_64-apple-ios12.0-simulator", null, true),
+        AppleTriple("iosArm64", "iphoneos", "arm64", "iOS", "15.0", "arm64-apple-ios15.0", null, true),
+        AppleTriple("iosSimulatorArm64", "iphonesimulator", "arm64", "iOS", "15.0", "arm64-apple-ios15.0-simulator", null, true),
+        AppleTriple("iosX64", "iphonesimulator", "x86_64", "iOS", "15.0", "x86_64-apple-ios15.0-simulator", null, true),
         // ── tvOS + watchOS — D4 spike: authored + link-smoke-gated, compile-faithful until proven ──
-        AppleTriple("tvosArm64", "appletvos", "arm64", "tvOS", "12.0", "arm64-apple-tvos12.0", null, false),
-        AppleTriple("tvosSimulatorArm64", "appletvsimulator", "arm64", "tvOS", "12.0", "arm64-apple-tvos12.0-simulator", null, false),
-        AppleTriple("tvosX64", "appletvsimulator", "x86_64", "tvOS", "12.0", "x86_64-apple-tvos12.0-simulator", null, false),
-        AppleTriple("watchosSimulatorArm64", "watchsimulator", "arm64", "watchOS", "7.0", "arm64-apple-watchos7.0-simulator", null, false),
-        AppleTriple("watchosX64", "watchsimulator", "x86_64", "watchOS", "7.0", "x86_64-apple-watchos7.0-simulator", null, false),
+        AppleTriple("tvosArm64", "appletvos", "arm64", "tvOS", "15.0", "arm64-apple-tvos15.0", null, false),
+        AppleTriple("tvosSimulatorArm64", "appletvsimulator", "arm64", "tvOS", "15.0", "arm64-apple-tvos15.0-simulator", null, false),
+        AppleTriple("tvosX64", "appletvsimulator", "x86_64", "tvOS", "15.0", "x86_64-apple-tvos15.0-simulator", null, false),
+        AppleTriple("watchosSimulatorArm64", "watchsimulator", "arm64", "watchOS", "8.0", "arm64-apple-watchos8.0-simulator", null, false),
+        AppleTriple("watchosX64", "watchsimulator", "x86_64", "watchOS", "8.0", "x86_64-apple-watchos8.0-simulator", null, false),
     )
 
 val isMacHost = System.getProperty("os.name").orEmpty().startsWith("Mac", ignoreCase = true)
@@ -1075,7 +1086,9 @@ fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider
                     .apply { deleteRecursively(); mkdirs() }
                 val cmakeArgs =
                     mutableListOf(
-                        "cmake", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+                        // BUILD_TESTING=OFF: BoringSSL's include(CTest) defaults it ON, which configures
+                        // Google benchmark, whose regex feature probes fail for the iOS/tvOS/watchOS SDKs.
+                        "cmake", "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF", "-DBUILD_TESTING=OFF",
                         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
                         "-DCMAKE_OSX_SYSROOT=$sysroot",
                         "-DCMAKE_OSX_ARCHITECTURES=${t.arch}",
@@ -1083,7 +1096,13 @@ fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider
                     )
                 // Non-macOS OSes need CMAKE_SYSTEM_NAME so cmake enters cross mode (and, with a
                 // *simulator* sysroot, tags objects for the simulator). macOS is the native host → omit.
-                if (t.systemName != null) cmakeArgs.add("-DCMAKE_SYSTEM_NAME=${t.systemName}")
+                // With CMAKE_SYSTEM_NAME=iOS/tvOS/watchOS cmake defaults executables to MACOSX_BUNDLE,
+                // and BoringSSL's unconditional `install(TARGETS bssl)` then fails configure ("no BUNDLE
+                // DESTINATION"). We never build the `bssl` tool, so keep it a plain executable.
+                if (t.systemName != null) {
+                    cmakeArgs.add("-DCMAKE_SYSTEM_NAME=${t.systemName}")
+                    cmakeArgs.add("-DCMAKE_MACOSX_BUNDLE=OFF")
+                }
                 cmakeArgs.addAll(listOf("-G", "Unix Makefiles", srcDir.absolutePath))
                 logger.lifecycle("Cross-compiling BoringSSL for ${t.id} (${t.sdk}, ${t.arch}, min ${t.minVersion})...")
                 runOrThrow(*cmakeArgs.toTypedArray(), dir = cmakeBuildDir, what = "cmake configure apple ${t.id}")
@@ -1186,19 +1205,23 @@ fun registerAppleTriple(t: AppleTriple): Triple<TaskProvider<Task>, TaskProvider
                 probe.writeText(
                     """
                     #include <openssl/sha.h>
+                    #include <openssl/ssl.h>
                     #include <stddef.h>
-                    /* Reference a real BoringSSL entry point so the archive is genuinely exercised. */
+                    /* Reference real libcrypto AND libssl entry points so both archives are exercised. */
                     unsigned char boringssl_apple_probe(const unsigned char *d, size_t n, unsigned char *out) {
                         SHA256(d, n, out);
+                        SSL_CTX_free(SSL_CTX_new(TLS_method()));
                         return out[0];
                     }
                     """.trimIndent() + "\n",
                 )
+                // -lc++: libssl.a is ordinary C++ (see androidCxxRuntime); the C driver links no C++
+                // runtime of its own, and K/N consumers already get libc++ from konan's Apple linker flags.
                 runOrThrow(
                     "clang", "-dynamiclib", "-target", t.clangTarget, "-isysroot", sysroot,
                     "-I", outDir.resolve("include").absolutePath, probe.absolutePath,
                     libDir.resolve("libssl.a").absolutePath, libDir.resolve("libcrypto.a").absolutePath,
-                    "-o", smokeDylib.absolutePath,
+                    "-lc++", "-o", smokeDylib.absolutePath,
                     dir = work, what = "apple link-smoke ${t.id}",
                 )
                 // D3: the static archive must export _SHA256_Init un-mangled (a prefix build renames it).
@@ -1365,7 +1388,10 @@ fun registerAppleVariant(t: AppleTriple): TaskProvider<Task> {
                         add("-DCMAKE_OSX_SYSROOT=$sysroot")
                         add("-DCMAKE_OSX_ARCHITECTURES=${t.arch}")
                         add("-DCMAKE_OSX_DEPLOYMENT_TARGET=${t.minVersion}")
-                        if (t.systemName != null) add("-DCMAKE_SYSTEM_NAME=${t.systemName}")
+                        if (t.systemName != null) {
+                            add("-DCMAKE_SYSTEM_NAME=${t.systemName}")
+                            add("-DCMAKE_MACOSX_BUNDLE=OFF") // see buildBoringSslApple: bssl install(BUNDLE)
+                        }
                     }
                 logger.lifecycle("Building content-addressed variant $variantAlias for ${t.id} (${t.sdk}, ${t.arch})...")
                 runOrThrow(

@@ -37,12 +37,17 @@ fun abiIncludeDir(abi: String) = bsslBuild.projectDir.resolve("libs/boringssl/an
 
 // One prefab module per BoringSSL library. ssl depends on crypto (export_libraries), so a consumer of
 // :ssl gets crypto's headers + archive on the link line transitively.
-data class PrefabModule(val name: String, val libBase: String, val exports: List<String>)
+// `stl` is prefab's STL requirement for the module. libcrypto carries no C++ runtime references
+// ("none"); libssl does (BoringSSL compiles it as ordinary C++), so it declares the libc++ family
+// ("c++_static"). For a static library prefab only checks the FAMILY, so a consumer on c++_static OR
+// c++_shared links it, and a consumer on ANDROID_STL=none is told to pick libc++ instead of failing
+// at link time on __cxa_*/operator delete.
+data class PrefabModule(val name: String, val libBase: String, val exports: List<String>, val stl: String)
 
 val prefabModules =
     listOf(
-        PrefabModule("crypto", "libcrypto", emptyList()),
-        PrefabModule("ssl", "libssl", listOf(":crypto")),
+        PrefabModule("crypto", "libcrypto", emptyList(), stl = "none"),
+        PrefabModule("ssl", "libssl", listOf(":crypto"), stl = "c++_static"),
     )
 
 val stagingDir = layout.buildDirectory.dir("prefab-aar")
@@ -96,7 +101,7 @@ val prepareAar =
                 abis.forEach { abi ->
                     val abiDir = modDir.resolve("libs/android.$abi").apply { mkdirs() }
                     abiDir.resolve("abi.json").writeText(
-                        """{"abi": "$abi", "api": $androidApi, "ndk": $ndkMajor, "stl": "none", "static": true}""" + "\n",
+                        """{"abi": "$abi", "api": $androidApi, "ndk": $ndkMajor, "stl": "${m.stl}", "static": true}""" + "\n",
                     )
                     abiLibDir(abi).resolve("${m.libBase}.a").copyTo(abiDir.resolve("${m.libBase}.a"), overwrite = true)
                 }

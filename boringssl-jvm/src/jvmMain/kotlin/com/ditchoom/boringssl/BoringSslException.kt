@@ -57,7 +57,7 @@ public class BoringSslBackendInfo internal constructor(
     public val flavor: String,
     /** The Maven coordinate that supplied the loaded native library. */
     public val coordinate: String,
-    /** Whether this flavor advertises DTLS 1.3 (else the canonical DTLS 1.2 baseline — D1a). */
+    /** Whether this flavor's BoringSSL has DTLS 1.3 (else DTLS 1.2 is its ceiling — D1a). */
     public val supportsDtls13: Boolean,
     /** BoringSSL's `OPENSSL_VERSION_NUMBER` as reported by the loaded library. */
     public val versionNumber: Long,

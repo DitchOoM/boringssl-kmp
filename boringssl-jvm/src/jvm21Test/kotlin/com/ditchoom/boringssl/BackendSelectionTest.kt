@@ -26,7 +26,7 @@ class BackendSelectionTest {
                 resourceExists = { it.endsWith("/META-INF/native/macos-aarch64/libboringsslffi.dylib") },
             )
         assertEquals(BoringSslFlavor.CANONICAL, chosen)
-        assertTrue(!chosen.supportsDtls13, "canonical is the DTLS 1.2 baseline")
+        assertTrue(chosen.supportsDtls13, "the canonical pin (API 41) has DTLS 1.3")
     }
 
     @Test
@@ -61,7 +61,7 @@ class BackendSelectionTest {
         val info = BoringSsl.backendInfo()
         assertEquals("canonical", info.flavor)
         assertEquals("com.ditchoom.boringssl:boringssl-jvm", info.coordinate)
-        assertTrue(!info.supportsDtls13, "canonical pin is DTLS 1.2 (D1a)")
+        assertTrue(info.supportsDtls13, "the canonical pin (API 41) has DTLS 1.3 (D1a)")
         assertTrue(info.versionNumber != 0L, "OPENSSL_VERSION_NUMBER must be non-zero once loaded")
     }
 

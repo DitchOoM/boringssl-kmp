@@ -10,9 +10,15 @@ ships **checksum-pinned prebuilt bundles** you drop into your build.
 > a JVM shared library). K/N gets a **one-line cinterop** with a canonical default `.def`; JVM is a
 > ready-to-call API; Android ships a prefab AAR you link your JNI shim against.
 
-**Canonical pin:** `google/boringssl @ 44b3df6f` (BoringSSL API 21) — the exact tree
-`boring-sys 4.22.0` vendors for `quiche 0.29.2`. That commit is the single source of truth; the pin
-follows quiche going forward.
+**Canonical pin:** `google/boringssl @ e2a57cfb` (BoringSSL API 41, DTLS 1.3) — the exact tree
+`boring-sys 5.2.0` vendors for `quiche 0.30.0`. That commit is the single source of truth; the pin
+follows quiche.
+
+**`libssl.a` needs the C++ runtime; `libcrypto.a` does not.** BoringSSL compiles libcrypto's C++ with
+`-fno-exceptions -fno-rtti` but libssl as ordinary C++. Kotlin/Native already links it (`-lc++` on
+Apple, static `libstdc++` on Linux). A plain C link that pulls libssl must add it: `-lc++` on Apple,
+`-lc++_static -lc++abi` with the NDK (the prefab `ssl` module declares `"stl": "c++_static"`), or link
+with a C++ driver. quiche 0.30.0 states the same requirement for static `libquiche.a` links.
 
 ---
 
